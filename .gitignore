@@ -1,0 +1,232 @@
+# ===== PYTHON =====
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+audioenv/
+
+# ===== FICHIERS AUDIO =====
+# Fichiers audio (souvent trop volumineux pour Git)
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.flac
+*.ogg
+*.wma
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Mais garder les petits fichiers de test
+!test_*.wav
+!sample_*.mp3
+
+# ===== MODÈLES ML & CACHE =====
+# Modèles Whisper téléchargés
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Cache des modèles
+.cache/
+models/
+checkpoints/
+
+# Hugging Face cache
+.huggingface/
+transformers_cache/
+
+# ===== RÉSULTATS & OUTPUTS =====
+# Dossiers de résultats
+transcriptions/
+faiss_indexes/
+outputs/
+results/
+logs/
+
+# Fichiers de résultats
+*.json
+*.rttm
+*.txt
+*.csv
+
+# Mais garder les exemples
+!example_*.json
+!README*.md
+
+# ===== CONFIGURATION & SECRETS =====
+# Variables d'environnement (contient des clés API)
+.env
+.env.*
+!.env.example
+
+# Configurations locales
+config.local.py
+settings.local.py
+secrets.py
+
+# Clés API et certificats
+*.pem
+*.key
+*.crt
+*.p12
+api_keys.txt
+credentials.json
+
+# ===== DOCKER =====
+# Build artifacts
+Dockerfile.local
+docker-compose.override.yml
+.dockerignore.local
+
+# ===== IDE & EDITORS =====
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# ===== SYSTÈME =====
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msm
+*.msp
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# ===== TEMPORAIRE =====
+# Fichiers temporaires
+*.tmp
+*.temp
+*.log
+*.bak
+*.backup
+*.old
+*.orig
+
+# Dossiers temporaires
+tmp/
+temp/
+.tmp/
+
+# ===== JUPYTER =====
+# Notebooks avec outputs
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# ===== SPÉCIFIQUE PROJET =====
+# Fichiers de test volumineux
+aidata_*.mp3
+aidata_*.wav
+test_long_*.wav
+
+# Cache spécifique
+embedding_cache/
+similarity_cache/
+
+# Fichiers de debug
+debug_*.py
+test_*.py
+scratch_*.py 
+
+
+# Fichier txt
+cmd.txt
