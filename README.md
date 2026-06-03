@@ -1,4 +1,4 @@
-# AudioPipeline
+# audio-to-rag
 
 > An async, event-driven backend pipeline that transforms raw meeting recordings into a structured, speaker-aware, semantically searchable knowledge base — fully automated on AWS.
 
@@ -185,7 +185,7 @@ The pipeline is designed to degrade gracefully rather than fail hard:
 
 ```bash
 # 1. Clone
-git clone https://github.com/your-username/AudioPipeline.git
+git clone https://github.com/SaturneAtom/AudioPipeline.git
 cd AudioPipeline
 
 # 2. Virtual environment
