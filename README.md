@@ -350,13 +350,6 @@ Helper scripts:
 
 ---
 
-## Contributing
-
-1. Fork and create a branch from `main`
-2. Make your changes
-3. `python -m py_compile *.py`
-4. Open a pull request — describe what changed and why
-
 ---
 
 ## License
