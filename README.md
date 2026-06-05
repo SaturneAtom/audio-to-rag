@@ -214,8 +214,6 @@ python main.py
 
 ## Configuration
 
-Copy `.env.example` to `.env`. **Never commit `.env`** — it is in `.gitignore`.
-
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `HF_TOKEN` | Yes | — | Hugging Face token (Pyannote diarization) |
@@ -228,17 +226,7 @@ Copy `.env.example` to `.env`. **Never commit `.env`** — it is in `.gitignore`
 | `VISIBILITY_TIMEOUT` | No | `3600` | SQS visibility timeout in seconds |
 | `ONE_SHOT_MODE` | No | `true` | Exit after one message — `false` for a persistent worker |
 | `NOVA_ENHANCED_EMBEDDINGS` | No | `true` | Enrich embeddings with Nova metadata before vectorizing |
-| `WHISPER_LANGUAGE` | No | `fr` | Whisper transcription language — any [supported code](https://github.com/openai/whisper#available-models-and-languages) (`en`, `es`, `de`, …) |
-
-### AWS credentials
-
-**Do not hardcode `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`.**
-
-Boto3 resolves credentials in order:
-
-1. **IAM role** — recommended for ECS (attach `iam-policy.json` to the task role; no credentials in the container)
-2. Environment variables — local dev only, never committed
-3. `~/.aws/credentials` — local dev via `aws configure`
+| `WHISPER_LANGUAGE` | No | `fr` | Whisper transcription language
 
 ---
 
@@ -254,16 +242,6 @@ Boto3 resolves credentials in order:
 | `BUCKET_NAME` | Your S3 bucket name |
 | `TABLE_NAME` | Main DynamoDB table name |
 | `UNIQUE_TABLE` | Secondary DynamoDB table name |
-
-```bash
-aws iam create-policy \
-  --policy-name AudioPipelinePolicy \
-  --policy-document file://iam-policy.json
-
-aws iam attach-role-policy \
-  --role-name <your-ecs-task-role> \
-  --policy-arn arn:aws:iam::<ACCOUNT_ID>:policy/AudioPipelinePolicy
-```
 
 ---
 
