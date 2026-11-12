@@ -1,6 +1,6 @@
 # audio-to-rag
 
-> An async, event-driven backend pipeline that transforms raw meeting recordings into a structured, speaker-aware, semantically searchable knowledge base — fully automated on AWS.
+> An async, queue-driven worker that turns raw meeting recordings into structured, speaker-aware, theme-labelled chunks with embeddings and a FAISS index, on AWS.
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![AWS](https://img.shields.io/badge/AWS-SQS%20%7C%20S3%20%7C%20DynamoDB%20%7C%20Bedrock-orange)
@@ -13,7 +13,11 @@
 
 Most teams record meetings and never revisit them. Finding a specific decision means listening to the whole thing again.
 
-AudioPipeline solves this as a backend service: when a recording is uploaded, it automatically produces **speaker-attributed topic chunks** with **512-dimensional vector embeddings**, stored in S3 and DynamoDB, ready for semantic search from any frontend or API.
+audio-to-rag solves this as a backend worker: given a recording in S3, it produces **speaker-attributed, theme-labelled chunks** with **512-dimensional vector embeddings** and a FAISS index, stored in S3, with the processing status in DynamoDB — ready for semantic search from any frontend or API.
+
+### Scope
+
+This repository contains the **processing worker only**. The trigger that launches it and the search / API layer that reads its output run in separate AWS Lambda functions that are **not part of this repository**.
 
 ---
 
@@ -26,53 +30,57 @@ Your app
    ▼
 S3 bucket ─────────────────────────────────────────────────┐
    │                                                       │
-   │  2. Push SQS message { userId, reunionId, s3Key }     │
+   │  2. Push SQS message { userId, reunionId, s3Audio }   │
    ▼                                                       │
 SQS queue                                                  │
    │                                                       │
-   │  3. Trigger (EventBridge Pipes or Lambda)             │
+   │  3. Trigger (not in this repo) starts one task        │
    ▼                                                       │
-ECS Fargate task — one-shot container (this repo)          │
+ECS task — one-shot container (this repo)                  │
    │  ┌──────────────────────────────────────────────┐    │
    │  │  download audio from S3 ◄─────────────────────────┘
    │  │  ↓
    │  │  [processing pipeline — see below]
    │  │  ↓
    │  │  upload chunks + FAISS index to S3
-   │  │  update DynamoDB status → PROCESSED
+   │  │  update DynamoDB status → TRAITÉ_INTELLIGENT
    │  └──────────────────────────────────────────────┘
    │
    ▼
 S3 (chunks JSON + FAISS index) + DynamoDB (status)
    │
-   └── consumed by your search / frontend layer
+   └── consumed by your search / frontend layer (not in this repo)
 ```
 
-The container exits after processing one message (`ONE_SHOT_MODE=true`). No idle cost. A new task is launched per message.
+With `ONE_SHOT_MODE=true` (the default) the container reads at most one message, processes it and exits: exit code `0` on success or when the queue is empty, non-zero when processing failed. Set `ONE_SHOT_MODE=false` to keep polling in a long-running worker.
 
 ---
 
 ## Processing pipeline
 
-Inside the container, the audio goes through 9 sequential steps:
+Inside the container, the audio goes through these steps, in this order:
 
 ```
 S3 audio file
     │
-    ├─► [1] ffmpeg              → convert to 16kHz mono WAV
+    ├─► [1] ffmpeg              → convert to 16 kHz mono WAV
     │
     ├─► [2] Whisper turbo       → timestamped transcript segments
     │
-    ├─► [3] Pyannote 3.1        → speaker diarization (who spoke when)
+    ├─► [3] Nova — Step 1       → clean transcription errors, remove filler words
+    │                             (cleaned text is redistributed over the original
+    │                              segments proportionally to their word counts)
     │
-    ├─► [4] Merge               → segments enriched with speaker attribution
-    │                             (majority-vote per segment on overlap)
+    ├─► [4] Nova — Step 2       → extract global themes, keywords, hot zones
     │
-    ├─► [5] Nova — Step 1       → clean transcription errors, remove filler words
+    ├─► [5] Pyannote 3.1        → speaker diarization (who spoke when)
     │
-    ├─► [6] Nova — Step 2       → extract global themes, keywords, hot zones
+    ├─► [6] Merge               → each segment gets the speaker with the longest overlap
     │
-    ├─► [7] Nova — Step 3       → semantic rechunking guided by step 6 output
+    ├─► [7] Chunk + Nova Step 3 → rule-based chunking (word count, pauses, speaker
+    │                             changes), then one Nova call per chunk to label it
+    │                             (theme, keywords, summary) using the step 4 themes;
+    │                             oversized chunks are split, short ones merged
     │
     ├─► [8] Titan Embed v2      → 512-dim vectors, enriched with Nova metadata
     │
@@ -90,38 +98,40 @@ S3 audio file
 A single mega-prompt asking Nova to simultaneously clean text, extract global themes, and produce semantic chunks would perform worse than three focused calls. The reason is both practical and architectural:
 
 - **Step 1** outputs cleaned text. Steps 2 and 3 receive denoised input — no filler words, no transcription artifacts biasing the semantic analysis.
-- **Step 2** produces a global thematic map of the full document. Step 3 receives this map as context, so it can group segments by topic with awareness of *all* themes across the recording, not just the local vicinity.
+- **Step 2** produces a global thematic map of the full document. Step 3 receives this map as context, so each chunk is labelled with awareness of *all* themes across the recording, not just the local vicinity.
 - Each call has its own `maxTokens` budget and `temperature=0.1` for determinism. A combined prompt would require guessing a single budget for three very different tasks.
 
-The outputs are chained: `clean text → global themes → rechunked segments guided by those themes`. This is a deliberate pipeline, not three independent LLM calls.
+The outputs are chained: `clean text → global themes → chunks labelled against those themes`. This is a deliberate pipeline, not three independent LLM calls. Note that step 3 is one Nova call *per chunk*, so the total number of Bedrock calls grows with the length of the recording.
 
 ### Why enriched embeddings?
 
 Standard RAG encodes raw text into vectors. The problem: two semantically equivalent sentences with different vocabulary produce distant embeddings. A recording saying *"on reporte au T3"* won't match a query for *"deadline change"* on vocabulary alone.
 
-Before calling Titan, each chunk's text is augmented with its Nova-derived metadata:
+Before calling Titan, each chunk's text is augmented with its Nova-derived metadata (`NOVA_ENHANCED_EMBEDDINGS=true`, the default):
 
 ```
-"On reporte la release au T3 vu le planning."
+"[Speaker_A1B2]: On reporte la release au T3 vu le planning."
   + [THEME: planning-release]
   + [TYPE: decision]
-  + [SPEAKERS: 2]
+  + [SUBJECT: planning-release]
 ```
 
-The embedding now carries **semantic intent** alongside lexical content. This is a standard technique in production RAG systems — metadata-aware or contextually enriched embeddings — applied here to the meeting domain.
+A `[SPEAKERS: ...]` tag is added only for chunks that Nova could not label. The stored chunk text is not modified — only the text sent to the embedding model. The embedding now carries **semantic intent** alongside lexical content: metadata-aware (contextually enriched) embeddings, applied here to the meeting domain. With `NOVA_ENHANCED_EMBEDDINGS=false`, the embeddings are computed on the plain chunk text.
 
-### Why semantic chunking instead of fixed windows?
+### Why rule-based chunks labelled by an LLM instead of fixed windows?
 
-Fixed-window chunking (e.g. every 30 seconds) is simple but lossy: a window may span multiple unrelated topics, or split a single decision across two chunks. Both hurt retrieval quality.
+Fixed-window chunking (e.g. every 30 seconds) is simple but lossy: a window may cut a sentence in half or glue two speakers' unrelated turns together. Both hurt retrieval quality.
 
-| Fixed-window | Semantic chunking (this pipeline) |
+| Fixed-window | This pipeline (default) |
 |---|---|
-| Arbitrary time boundaries | Variable-length, topic-aligned |
-| May split a decision mid-sentence | Each chunk ends at a natural topic break |
-| No theme metadata | Theme, content type, keywords attached |
-| Retrieval matches by proximity | Retrieval matches by idea |
+| Arbitrary time boundaries | Variable length, 50–150 words targeted |
+| May split mid-sentence | Closes on a sentence end followed by a pause (> 0.8 s) or a speaker change; hard cut at 150 words |
+| No metadata | Theme, content type, keywords and one-line summary attached by Nova |
+| Retrieval on raw text only | Retrieval on text + theme metadata |
 
-Nova (step 7) reads all segments and groups them by topic. If Nova returns nothing, a fallback algorithm uses temporal gaps and speaker changes as chunk boundaries.
+**Default behaviour.** Chunk boundaries are decided by deterministic rules in `chunking.py` (word count, pauses, speaker changes), not by the LLM. Nova then analyses each chunk and attaches its metadata without changing the content. Finally, chunks above 150 words are split on segment boundaries and chunks under 50 words are merged into the most similar neighbour (cosine similarity above 0.5). Boundaries are therefore sentence- and turn-aligned, but they are not guaranteed to coincide with topic changes.
+
+**Optional: `NOVA_DIRECT_CHUNKING=true`.** Nova receives all segments in one prompt and groups them by topic; those groups become the base chunks, which then go through the same labelling and size adjustment. Nova's answer is only accepted if it assigns every segment exactly once, in contiguous runs. On any failure (call error, unparsable JSON, incomplete grouping) the worker falls back to the rule-based chunker. This mode is off by default: it puts the whole transcript in a single prompt and has been exercised by unit tests only.
 
 ### Why one-shot ECS instead of a persistent worker?
 
@@ -129,26 +139,37 @@ A persistent worker container running 24/7 costs money even when idle and serial
 
 - **Cost**: the container exits after one message. Zero compute cost between jobs.
 - **Isolation**: no shared state between messages. Each job is a clean process.
-- **Parallelism**: 10 messages in the queue = 10 independent containers launched simultaneously, each processing one recording.
+- **Parallelism**: each task handles one recording, so the trigger can launch as many tasks as there are messages.
 
-The trade-off is cold start latency (~30–60s for model loading). For async audio processing this is acceptable; for real-time use cases it would not be.
+The trade-off is cold start latency: the Whisper and Pyannote weights are not baked into the image, so they are downloaded and loaded on every start. For async audio processing this is acceptable; for real-time use cases it would not be.
 
-### Resilience: three levels of fallback
+### Resilience and failure handling
 
-The pipeline is designed to degrade gracefully rather than fail hard:
+Some steps degrade gracefully, others fail the job on purpose:
 
-1. **Whisper turbo fails** → automatic retry with Whisper tiny (lower accuracy but always available)
-2. **Nova rechunking returns nothing** → fallback to algorithmic chunking (temporal gaps + speaker changes + word count thresholds)
-3. **Nova JSON response truncated** → automatic pagination: the pipeline detects incomplete JSON and requests continuations, up to 5 iterations
-4. **All AWS operations** → exponential backoff retry wrapper with configurable max attempts
+| Situation | Behaviour |
+|---|---|
+| Whisper turbo fails | One retry with Whisper tiny (lower accuracy); if that fails too, the job fails |
+| ffmpeg conversion fails | The job fails |
+| Nova step 1 (cleaning) fails | The raw transcript is used |
+| Nova step 2 (global themes) fails | The job fails |
+| Diarization fails (or `HF_TOKEN` is missing) | All segments keep a single placeholder speaker |
+| Nova labelling fails for one chunk | That chunk keeps its placeholder theme (most frequent words) |
+| `NOVA_DIRECT_CHUNKING` grouping fails | Rule-based chunking is used |
+| Nova JSON response looks truncated | Up to 5 continuation requests are appended. The detection is a heuristic (a response that fails to parse with an "Expecting ..." error); a response cut in the middle of a string is not detected |
+| An embedding is missing when the index is built | The job fails, so that row *i* of the FAISS index always matches chunk *i* of the chunks JSON |
+| S3 download/upload, the main DynamoDB update, Bedrock calls (Nova and Titan) | Retried on `ClientError` with exponential backoff (1 s, 2 s, ...) up to `MAX_RETRIES` attempts, on top of boto3's own retries |
+| SQS calls and the secondary-table update | Single attempt (boto3's own retries only) |
+
+**When a job fails**, the worker logs the error, writes `etat = "FAILED"` to both DynamoDB tables on a best-effort basis (a failure of that write is only logged), leaves the message in the queue, and — in one-shot mode — exits with a non-zero code. Whether the message is retried depends on your trigger and on the queue's redrive policy; a dead-letter queue is recommended.
 
 ### Security surface
 
 - **SQS message validation**: every field (`userId`, `reunionId`, `s3Audio`) is validated against a strict regex before any processing. Malformed messages are discarded, not retried.
-- **SQS visibility extension**: the visibility timeout is extended during processing to prevent a second consumer from picking up the same message if the job is slow.
+- **SQS visibility extension**: the visibility timeout is set to `VISIBILITY_TIMEOUT` when the message is received and again after the download. There is no heartbeat: a job that runs longer than `VISIBILITY_TIMEOUT` can be delivered a second time.
 - **Path traversal**: audio files are restricted to `/tmp` via `Path.relative_to()` before any filesystem operation.
-- **Speaker anonymization**: Pyannote speaker labels (`SPEAKER_00`, etc.) are replaced with random IDs (`Speaker_A1B2`) at diarization time. No real names are ever stored.
-- **IAM least-privilege**: the included policy grants exactly the permissions used — `sqs:ReceiveMessage/DeleteMessage/ChangeMessageVisibility`, `s3:GetObject/PutObject`, `dynamodb:UpdateItem`, `bedrock:InvokeModel` on specific resources only.
+- **Speaker labels**: Pyannote speaker labels (`SPEAKER_00`, etc.) are replaced with random IDs (`Speaker_A1B2`) at diarization time. The pipeline never tries to identify speakers; names that are spoken aloud remain in the transcript text.
+- **IAM least-privilege**: the included policy is scoped to specific resources — `sqs:ReceiveMessage/DeleteMessage/ChangeMessageVisibility/GetQueueAttributes`, `s3:GetObject/PutObject`, `dynamodb:UpdateItem`, `bedrock:InvokeModel`.
 
 ---
 
@@ -160,7 +181,8 @@ The pipeline is designed to degrade gracefully rather than fail hard:
 | Speaker diarization | Pyannote Audio 3.1 | Who spoke and when |
 | Text cleaning | Amazon Nova Lite | Fix errors, remove filler words |
 | Semantic analysis | Amazon Nova Lite | Extract themes, keywords, hot zones |
-| Semantic chunking | Amazon Nova Lite | Group segments by topic |
+| Chunking | Rule-based (`chunking.py`) | Word-count, pause and speaker-change boundaries |
+| Chunk labelling | Amazon Nova Lite | Theme, keywords, summary per chunk (optional topic grouping) |
 | Embeddings | Amazon Titan Embed v2 (512d) | Dense vector representations |
 | Vector search | FAISS IndexFlatIP | Cosine similarity via L2-normalized inner product |
 | Queue | AWS SQS | Async job dispatch |
@@ -185,30 +207,39 @@ The pipeline is designed to degrade gracefully rather than fail hard:
 
 ```bash
 # 1. Clone
-git clone https://github.com/SaturneAtom/AudioPipeline.git
-cd AudioPipeline
+git clone https://github.com/SaturneAtom/audio-to-rag.git
+cd audio-to-rag
 
 # 2. Virtual environment
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
-# 3. Install dependencies
-pip install git+https://github.com/openai/whisper.git
+# 3. Install dependencies (torch first; see INSTALLATION.md for GPU builds)
+pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
-python -m spacy download fr_core_news_md
+pip install git+https://github.com/openai/whisper.git
 
 # 4. Configure
 cp .env.example .env
 # Edit .env — see Configuration section below
 
-# 5. Run
+# 5. Run (polls the SQS queue; needs AWS credentials)
 python main.py
 ```
 
-> **Verify install without AWS calls:**
-> ```bash
-> python -m py_compile *.py
-> ```
+See [INSTALLATION.md](INSTALLATION.md) for AWS credentials, the Hugging Face token, GPU builds and troubleshooting.
+
+### Tests
+
+The unit tests cover the pure logic (message validation, path guard, speaker merge, chunking rules, split/merge, Nova JSON handling, retries). They stub the heavy dependencies and AWS clients, so they need neither torch nor AWS access:
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+ruff check .
+```
+
+There is no end-to-end test: the full pipeline is only exercised against real AWS services.
 
 ---
 
@@ -222,11 +253,14 @@ python main.py
 | `DYNAMODB_TABLE_NAME` | Yes | — | Main DynamoDB table |
 | `UNIQUE_MEETINGS_TABLE_NAME` | No | `UniqueMeetings` | Secondary table for frontend |
 | `AWS_REGION` | No | `us-east-1` | AWS region |
-| `MAX_RETRIES` | No | `3` | Boto3 retry attempts |
+| `MAX_RETRIES` | No | `3` | Attempts for boto3 and for the backoff wrapper |
 | `VISIBILITY_TIMEOUT` | No | `3600` | SQS visibility timeout in seconds |
 | `ONE_SHOT_MODE` | No | `true` | Exit after one message — `false` for a persistent worker |
 | `NOVA_ENHANCED_EMBEDDINGS` | No | `true` | Enrich embeddings with Nova metadata before vectorizing |
-| `WHISPER_LANGUAGE` | No | `fr` | Whisper transcription language
+| `NOVA_DIRECT_CHUNKING` | No | `false` | Let Nova group segments by topic; falls back to rule-based chunking on any failure |
+| `WHISPER_LANGUAGE` | No | `fr` | Whisper transcription language |
+
+The Nova prompts are written in French because the pipeline was built for French meetings; the generated themes, keywords and summaries, and several output keys, are therefore in French.
 
 ---
 
@@ -261,7 +295,7 @@ python main.py
 | `reunionId` | `[a-zA-Z0-9_-]{1,128}` | Unique meeting identifier |
 | `s3Audio` | S3 key, max 512 chars | Path to the audio file in `S3_BUCKET_NAME` |
 
-Messages failing validation are deleted from the queue immediately — they would fail on every retry.
+Messages failing validation (or that are not valid JSON) are deleted from the queue immediately — they would fail on every retry. No status is written for them.
 
 ---
 
@@ -278,6 +312,8 @@ Messages failing validation are deleted from the queue immediately — they woul
 ```
 
 ### Chunk structure
+
+Abridged example (each chunk also carries `reasoning`, `is_topic_transition`, `transition_score`, `cluster_id`, and more `nova_chunking` fields):
 
 ```json
 {
@@ -310,26 +346,43 @@ Messages failing validation are deleted from the queue immediately — they woul
 }
 ```
 
-> Speaker IDs (e.g. `Speaker_A1B2`) are randomly generated per recording — consistent within a meeting, not across meetings. No real names are stored.
+> Speaker IDs (e.g. `Speaker_A1B2`) are randomly generated per recording — consistent within a meeting, not across meetings.
+
+---
+
+## DynamoDB status
+
+The worker updates the item with key `{ userId, reunionId }` in `DYNAMODB_TABLE_NAME`, and the `etat` attribute of the same key in `UNIQUE_MEETINGS_TABLE_NAME`.
+
+| Attribute | Written when | Value |
+|-----------|--------------|-------|
+| `etat` | Success | `TRAITÉ_INTELLIGENT` |
+| `etat` | Failure (best effort) | `FAILED` |
+| `s3Chunks` | Success | S3 key of the chunks JSON |
+| `s3Index` | Success | S3 key of the FAISS index |
+| `processedAt` | Success | ISO 8601 timestamp |
 
 ---
 
 ## Deploy on ECS
 
 ```bash
-docker build -t audio-pipeline .
-docker tag audio-pipeline:latest <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/audio-pipeline:latest
+docker build -t audio-to-rag .
+docker tag audio-to-rag:latest <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/audio-to-rag:latest
 aws ecr get-login-password --region <REGION> | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com
-docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/audio-pipeline:latest
+docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/audio-to-rag:latest
 ```
 
-Configure an **EventBridge Pipe** (or Lambda trigger) from the SQS queue to launch a new ECS task per message. With `ONE_SHOT_MODE=true` the cluster scales to zero between jobs.
+The image installs ffmpeg, the Python dependencies and Whisper, and runs as a non-root user.
 
-For GPU inference (Whisper + Pyannote are significantly faster on GPU), the base image is `pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime`. Use `g4dn.xlarge` or larger.
+Run it as an **ECS task** started once per SQS message by your own trigger (for example a Lambda function or an EventBridge Pipe calling `RunTask`); the trigger is not part of this repository. With `ONE_SHOT_MODE=true` the task exits when its message is done, so nothing runs between jobs.
 
-Helper scripts:
-- `simple-ecs.sh` — configure the ECS agent on a GPU EC2 instance
-- `user-data` — EC2 user-data bootstrap for ECS-optimized AMI
+- **CPU**: Fargate is an option for CPU-only runs. Fargate has no GPU, so Whisper and Pyannote run on CPU there (slower; size the task memory for the models) — override the base image with a CPU PyTorch image via `--build-arg BASE_IMAGE=...` if you want a smaller image.
+- **GPU**: Whisper and Pyannote are significantly faster on GPU. The default base image is `pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime`; run the task on ECS with **EC2 GPU instances** (`g4dn.xlarge` or larger).
+
+Helper scripts for the EC2 GPU option:
+- `simple-ecs.sh` — configure the ECS agent on a GPU EC2 instance (ECS-optimized AMI)
+- `user-data` — EC2 user-data bootstrap that installs and starts the ECS agent
 
 ---
 
@@ -337,18 +390,17 @@ Helper scripts:
 
 | File | Responsibility |
 |------|----------------|
-| `main.py` | Entry point — validates config, starts worker |
-| `worker.py` | SQS polling, input validation, pipeline orchestration |
+| `main.py` | Entry point — logs the configuration, starts the worker, sets the exit code |
+| `worker.py` | SQS polling, input validation, pipeline orchestration, DynamoDB status |
 | `audio.py` | WAV conversion, Whisper transcription, Pyannote diarization, speaker anonymization |
-| `nova.py` | 3-step Nova pipeline, JSON pagination handling, chunk enrichment |
+| `nova.py` | 3-step Nova pipeline, JSON pagination handling, chunk labelling, optional Nova grouping |
 | `embeddings.py` | Titan embedding generation, metadata enrichment, FAISS index creation |
-| `chunking.py` | Fallback chunking, chunk splitting/merging, cosine similarity |
-| `storage.py` | S3 uploads (chunks JSON, FAISS index, metadata), DynamoDB writes |
+| `chunking.py` | Rule-based chunking, chunk splitting/merging, cosine similarity |
+| `storage.py` | S3 uploads of the chunks JSON and FAISS index |
 | `models.py` | `Chunk` dataclass, custom JSON encoder |
-| `aws_utils.py` | Exponential backoff retry wrappers for S3, DynamoDB, SQS |
-| `config.py` | Environment loading, AWS client initialization, device detection |
-
----
+| `aws_utils.py` | Exponential backoff retry helper, S3 / DynamoDB wrappers, SQS visibility extension |
+| `config.py` | Environment loading and validation, constants, AWS client initialization, device detection |
+| `tests/` | Unit tests for the pure logic (heavy dependencies stubbed) |
 
 ---
 
