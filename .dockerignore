@@ -1,4 +1,4 @@
-# ===== FICHIERS DE DÉVELOPPEMENT =====
+# ===== DEVELOPMENT FILES =====
 README.md
 *.md
 .git/
@@ -6,7 +6,7 @@ README.md
 .env
 .env.*
 
-# ===== IDE ET ÉDITEURS =====
+# ===== IDE AND EDITORS =====
 .vscode/
 .idea/
 *.swp
@@ -36,7 +36,7 @@ wheels/
 *.egg
 MANIFEST
 
-# ===== ENVIRONNEMENTS VIRTUELS =====
+# ===== VIRTUAL ENVIRONMENTS =====
 venv/
 env/
 ENV/
@@ -47,7 +47,7 @@ ENV/
 .ipynb_checkpoints
 *.ipynb
 
-# ===== DONNÉES AUDIO ET RÉSULTATS =====
+# ===== AUDIO DATA AND RESULTS =====
 *.mp3
 *.wav
 *.m4a
@@ -61,7 +61,7 @@ faiss_indexes/
 outputs/
 results/
 
-# ===== FICHIERS TEMPORAIRES =====
+# ===== TEMPORARY FILES =====
 tmp/
 temp/
 .tmp/
@@ -74,6 +74,7 @@ logs/
 log/
 
 # ===== TESTS =====
+requirements-dev.txt
 tests/
 test/
 *_test.py
@@ -100,7 +101,7 @@ aws-credentials
 *.pem
 *.key
 
-# ===== MODÈLES PRÉ-ENTRAÎNÉS (trop lourds) =====
+# ===== PRE-TRAINED MODELS (too large) =====
 *.bin
 *.safetensors
 *.pt
@@ -115,15 +116,14 @@ cache/
 .mypy_cache/
 .ruff_cache/
 
-# ===== SYSTÈME =====
+# ===== SYSTEM =====
 .DS_Store
 Thumbs.db
 *.bak
 *.swp
 *.swo
 
-# ===== SPÉCIFIQUE AU PROJET =====
-# Garder seulement main.py et requirements.txt
+# ===== PROJECT SPECIFIC =====
 pipeline.py
 main_simple.py
 arte.mp3

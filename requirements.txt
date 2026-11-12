@@ -1,0 +1,25 @@
+# audio-to-rag — runtime dependencies
+# Install with: pip install -r requirements.txt
+#
+# PyTorch is provided by the Docker base image (pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime).
+# For a local CPU-only setup: pip install torch --index-url https://download.pytorch.org/whl/cpu
+#
+# Whisper is installed separately from source (the Dockerfile does this):
+#   pip install git+https://github.com/openai/whisper.git
+
+# AWS SDK
+boto3
+botocore
+
+# Audio processing (duration probe)
+librosa
+
+# Speaker diarization
+pyannote.audio
+
+# Vector search
+faiss-cpu
+
+# Utilities
+numpy
+python-dotenv

@@ -1,0 +1,54 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SQSConsumer",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:ChangeMessageVisibility",
+        "sqs:GetQueueAttributes"
+      ],
+      "Resource": "arn:aws:sqs:REGION:ACCOUNT_ID:QUEUE_NAME"
+    },
+    {
+      "Sid": "S3ReadAudio",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::BUCKET_NAME/*"
+    },
+    {
+      "Sid": "S3WriteResults",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::BUCKET_NAME/*"
+    },
+    {
+      "Sid": "DynamoDBUpdateStatus",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:UpdateItem"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/TABLE_NAME",
+        "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/UNIQUE_TABLE"
+      ]
+    },
+    {
+      "Sid": "BedrockFoundationModels",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:REGION::foundation-model/amazon.nova-lite-v1:0",
+        "arn:aws:bedrock:REGION::foundation-model/amazon.titan-embed-text-v2:0"
+      ]
+    }
+  ]
+}

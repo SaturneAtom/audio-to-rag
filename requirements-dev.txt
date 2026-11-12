@@ -1,0 +1,9 @@
+# Development tools (tests and linting). The test suite stubs the heavy
+# runtime dependencies, so it only needs the light packages below.
+pytest
+ruff
+
+# Light runtime dependencies imported by the tests
+boto3
+numpy
+python-dotenv
