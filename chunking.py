@@ -2,12 +2,17 @@ import re
 import logging
 import numpy as np
 from collections import Counter
-from typing import List, Dict, Optional
+from typing import List, Dict
 from config import MIN_WORDS_PER_CHUNK, MAX_WORDS_PER_CHUNK
 from models import Chunk
 from embeddings import generate_titan_embedding
 
 logger = logging.getLogger(__name__)
+
+# A silence longer than this between two segments counts as a chunk boundary.
+PAUSE_BOUNDARY_SECONDS = 0.8
+# Minimum cosine similarity for a short chunk to be merged into a neighbour.
+MERGE_SIMILARITY_THRESHOLD = 0.5
 
 _STOP_WORDS = {
     'alors', 'donc', 'mais', 'pour', 'avec', 'dans', 'cette', 'celui', 'celle',
@@ -25,9 +30,9 @@ def count_words(text: str) -> int:
 
 
 def create_chunk_from_segments(segments: List[Dict], chunk_id: int) -> Chunk:
-    """Crée un Chunk à partir d'une liste de segments avec speakers"""
+    """Build a Chunk (speaker-tagged text, speaker stats, embedding) from a list of segments."""
     if not segments:
-        raise ValueError("Segments vides")
+        raise ValueError("Cannot build a chunk from an empty segment list")
 
     start_time = segments[0]["start"]
     end_time = segments[-1]["end"]
@@ -81,7 +86,7 @@ def create_chunk_from_segments(segments: List[Dict], chunk_id: int) -> Chunk:
 
 
 def find_chunk_segments(chunk: Chunk, segments: List[Dict]) -> List[Dict]:
-    """Retrouve les segments originaux qui correspondent à un chunk via timestamps"""
+    """Return the original segments that overlap a chunk's time range."""
     return [
         seg for seg in segments
         if seg["start"] < chunk.end_time and seg["end"] > chunk.start_time
@@ -89,33 +94,14 @@ def find_chunk_segments(chunk: Chunk, segments: List[Dict]) -> List[Dict]:
 
 
 def divide_chunk_intelligently(chunk: Chunk, chunk_segments: List[Dict], max_words: int) -> List[Chunk]:
-    """Divise un chunk trop long en respectant les frontières de segments"""
+    """Split an oversized chunk on segment boundaries."""
     if not chunk_segments:
         return divide_chunk_by_words(chunk, max_words)
 
     sub_chunks = []
-    current_segments = []
-    current_words = 0
 
-    for segment in chunk_segments:
-        segment_words = count_words(segment["text"])
-
-        if current_words + segment_words > max_words and current_segments:
-            sub_chunk = create_chunk_from_segments(current_segments, len(sub_chunks) + 1)
-            sub_chunk.theme = chunk.theme
-            sub_chunk.nova_chunking = chunk.nova_chunking.copy()
-            sub_chunk.nova_chunking["parent_chunk_id"] = chunk.id
-            sub_chunk.nova_chunking["division_reason"] = "too_long"
-            sub_chunk.nova_chunking["sub_chunk_index"] = len(sub_chunks) + 1
-            sub_chunks.append(sub_chunk)
-            current_segments = [segment]
-            current_words = segment_words
-        else:
-            current_segments.append(segment)
-            current_words += segment_words
-
-    if current_segments:
-        sub_chunk = create_chunk_from_segments(current_segments, len(sub_chunks) + 1)
+    def flush(group: List[Dict]) -> None:
+        sub_chunk = create_chunk_from_segments(group, len(sub_chunks) + 1)
         sub_chunk.theme = chunk.theme
         sub_chunk.nova_chunking = chunk.nova_chunking.copy()
         sub_chunk.nova_chunking["parent_chunk_id"] = chunk.id
@@ -123,11 +109,28 @@ def divide_chunk_intelligently(chunk: Chunk, chunk_segments: List[Dict], max_wor
         sub_chunk.nova_chunking["sub_chunk_index"] = len(sub_chunks) + 1
         sub_chunks.append(sub_chunk)
 
+    current_segments = []
+    current_words = 0
+
+    for segment in chunk_segments:
+        segment_words = count_words(segment["text"])
+
+        if current_words + segment_words > max_words and current_segments:
+            flush(current_segments)
+            current_segments = [segment]
+            current_words = segment_words
+        else:
+            current_segments.append(segment)
+            current_words += segment_words
+
+    if current_segments:
+        flush(current_segments)
+
     return sub_chunks
 
 
 def divide_chunk_by_words(chunk: Chunk, max_words: int) -> List[Chunk]:
-    """Fallback : division brutale d'un chunk par nombre de mots"""
+    """Last-resort split by word count, preferring sentence endings as cut points."""
     words = chunk.text.split()
     total_words = len(words)
 
@@ -167,7 +170,7 @@ def divide_chunk_by_words(chunk: Chunk, max_words: int) -> List[Chunk]:
 
 
 def calculate_chunk_similarity(chunk1: Chunk, chunk2: Chunk) -> float:
-    """Calcule la similarité cosinus entre deux chunks"""
+    """Cosine similarity between two chunk embeddings (0.0 if either is missing)."""
     if chunk1.embedding is None or chunk2.embedding is None:
         return 0.0
 
@@ -182,7 +185,7 @@ def calculate_chunk_similarity(chunk1: Chunk, chunk2: Chunk) -> float:
 
 
 def merge_chunks(chunk1: Chunk, chunk2: Chunk) -> Chunk:
-    """Fusionne deux chunks en conservant les métadonnées et en recalculant l'embedding"""
+    """Merge two chunks, keeping the first chunk's metadata and recomputing the embedding."""
     merged_text = chunk1.text + " " + chunk2.text
     merged_start = min(chunk1.start_time, chunk2.start_time)
     merged_end = max(chunk1.end_time, chunk2.end_time)
@@ -219,7 +222,7 @@ def merge_chunks(chunk1: Chunk, chunk2: Chunk) -> Chunk:
 
 
 def merge_short_chunks_intelligently(chunks: List[Chunk]) -> List[Chunk]:
-    """Fusionne les chunks trop courts avec leur voisin le plus similaire"""
+    """Merge chunks flagged as too short into their most similar neighbour."""
     if len(chunks) <= 1:
         return chunks
 
@@ -254,15 +257,15 @@ def merge_short_chunks_intelligently(chunks: List[Chunk]) -> List[Chunk]:
                         best_neighbor = next_chunk
                         best_neighbor_idx = i + 1
 
-            if best_similarity > 0.5:
-                logger.debug(f"Fusion chunk {current_chunk.id} avec voisin (similarité: {best_similarity:.3f})")
+            if best_similarity > MERGE_SIMILARITY_THRESHOLD:
+                logger.debug(f"Merging chunk {current_chunk.id} with neighbour (similarity: {best_similarity:.3f})")
                 if best_neighbor_idx < i:
                     final_chunks[-1] = merge_chunks(final_chunks[-1], current_chunk)
                 else:
                     final_chunks.append(merge_chunks(current_chunk, best_neighbor))
                     i += 1
             else:
-                logger.debug(f"Chunk {current_chunk.id} reste court (pas de voisin similaire)")
+                logger.debug(f"Chunk {current_chunk.id} stays short (no similar neighbour)")
                 final_chunks.append(current_chunk)
         else:
             final_chunks.append(current_chunk)
@@ -273,7 +276,7 @@ def merge_short_chunks_intelligently(chunks: List[Chunk]) -> List[Chunk]:
 
 
 def _extract_theme_from_text(text: str, chunk_index: int) -> str:
-    """Extrait un thème à partir du contenu textuel pour le fallback"""
+    """Derive a placeholder theme from the most frequent meaningful words of the text."""
     words = re.findall(r'\b\w{4,}\b', text.lower())
     meaningful_words = [w for w in words if w not in _STOP_WORDS and len(w) > 3]
 
@@ -284,62 +287,70 @@ def _extract_theme_from_text(text: str, chunk_index: int) -> str:
     return f"Discussion - Segment {chunk_index}"
 
 
-def create_semantic_chunks_fallback(segments: List[Dict]) -> List[Chunk]:
-    """Chunking basique de secours quand Nova n'est pas disponible"""
-    logger.info("🔄 Chunking basique de secours avec métadonnées Nova...")
+def _build_rule_based_chunk(chunk_segments: List[Dict], chunk_id: int, is_last: bool) -> Chunk:
+    """Create a chunk with placeholder metadata; Nova labels it later in step 3.
+
+    The `reasoning` and `justification` strings are stored in the output JSON
+    and are kept in French like the rest of the generated content.
+    """
+    text = " ".join(s["text"] for s in chunk_segments)
+    words = count_words(text)
+    chunk = create_chunk_from_segments(chunk_segments, chunk_id)
+    theme = _extract_theme_from_text(text, chunk_id)
+    chunk.theme = theme
+    if is_last:
+        chunk.reasoning = f"Chunk final de {words} mots avec analyse du contenu"
+        justification = f"Segmentation finale basée sur {words} mots et analyse du contenu"
+    else:
+        chunk.reasoning = f"Chunk automatique de {words} mots avec analyse du contenu"
+        justification = f"Segmentation automatique basée sur {words} mots et analyse du contenu"
+    chunk.nova_chunking = {
+        "type_contenu": "discussion",
+        "speakers_impliques": list(set(seg["speaker"] for seg in chunk_segments)),
+        "justification": justification,
+        "theme_principal": theme
+    }
+    return chunk
+
+
+def create_rule_based_chunks(segments: List[Dict]) -> List[Chunk]:
+    """Default chunker: group consecutive segments using word-count and pause rules.
+
+    A chunk is closed when it reaches MAX_WORDS_PER_CHUNK words, or when it has
+    at least MIN_WORDS_PER_CHUNK words and the current segment ends a sentence
+    that is followed by a pause, a speaker change or the end of the recording.
+    """
+    logger.info("Rule-based chunking...")
 
     chunks = []
     current_chunk_segments = []
 
     for i, segment in enumerate(segments):
         current_chunk_segments.append(segment)
-        current_text = " ".join([s["text"] for s in current_chunk_segments])
-        current_words = count_words(current_text)
+        current_words = count_words(" ".join(s["text"] for s in current_chunk_segments))
 
         should_end_chunk = False
 
-        if current_words >= 150:
+        if current_words >= MAX_WORDS_PER_CHUNK:
             should_end_chunk = True
-        elif current_words >= 50:
+        elif current_words >= MIN_WORDS_PER_CHUNK:
             segment_text = segment["text"].strip()
             if segment_text.endswith(('.', '!', '?')):
                 if i + 1 < len(segments):
                     next_segment = segments[i + 1]
                     gap = next_segment["start"] - segment["end"]
                     speaker_change = next_segment["speaker"] != segment["speaker"]
-                    if gap > 0.8 or speaker_change:
+                    if gap > PAUSE_BOUNDARY_SECONDS or speaker_change:
                         should_end_chunk = True
                 else:
                     should_end_chunk = True
 
-        if should_end_chunk and current_chunk_segments:
-            chunk = create_chunk_from_segments(current_chunk_segments, len(chunks) + 1)
-            theme = _extract_theme_from_text(current_text, len(chunks) + 1)
-            chunk.theme = theme
-            chunk.reasoning = f"Chunk automatique de {current_words} mots avec analyse du contenu"
-            chunk.nova_chunking = {
-                "type_contenu": "discussion",
-                "speakers_impliques": list(set([seg["speaker"] for seg in current_chunk_segments])),
-                "justification": f"Segmentation automatique basée sur {current_words} mots et analyse du contenu",
-                "theme_principal": theme
-            }
-            chunks.append(chunk)
+        if should_end_chunk:
+            chunks.append(_build_rule_based_chunk(current_chunk_segments, len(chunks) + 1, is_last=False))
             current_chunk_segments = []
 
     if current_chunk_segments:
-        current_text = " ".join([s["text"] for s in current_chunk_segments])
-        current_words = count_words(current_text)
-        chunk = create_chunk_from_segments(current_chunk_segments, len(chunks) + 1)
-        theme = _extract_theme_from_text(current_text, len(chunks) + 1)
-        chunk.theme = theme
-        chunk.reasoning = f"Chunk final de {current_words} mots avec analyse du contenu"
-        chunk.nova_chunking = {
-            "type_contenu": "discussion",
-            "speakers_impliques": list(set([seg["speaker"] for seg in current_chunk_segments])),
-            "justification": f"Segmentation finale basée sur {current_words} mots et analyse du contenu",
-            "theme_principal": theme
-        }
-        chunks.append(chunk)
+        chunks.append(_build_rule_based_chunk(current_chunk_segments, len(chunks) + 1, is_last=True))
 
-    logger.info(f"✅ {len(chunks)} chunks créés avec métadonnées Nova enrichies")
+    logger.info(f"{len(chunks)} rule-based chunks created")
     return chunks

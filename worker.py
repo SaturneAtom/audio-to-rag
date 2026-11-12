@@ -3,22 +3,21 @@ import re
 import json
 import logging
 import signal
-import traceback
 import torch
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 from botocore.exceptions import ClientError
 
 from config import (S3_BUCKET_NAME, DYNAMODB_TABLE_NAME, SQS_QUEUE_URL,
                     UNIQUE_MEETINGS_TABLE_NAME, ONE_SHOT_MODE, NOVA_ENHANCED_EMBEDDINGS,
-                    VISIBILITY_TIMEOUT, sqs_client, dynamodb)
+                    VISIBILITY_TIMEOUT, STATUS_PROCESSED, STATUS_FAILED, sqs_client, dynamodb)
 from models import Chunk, CustomJSONEncoder
 from aws_utils import safe_s3_download, safe_s3_upload, safe_dynamodb_update, extend_visibility_timeout
 from audio import convert_to_wav, transcribe_audio, perform_diarization, merge_transcription_diarization
 from embeddings import regenerate_embeddings_after_enrichment, create_faiss_index
 from nova import (clean_text_with_nova_step1, extract_global_themes_with_nova_step2,
                   apply_cleaned_text_to_segments, rechunk_thematically_step3)
-from chunking import create_semantic_chunks_fallback
+from chunking import create_rule_based_chunks
 from storage import save_results_to_s3
 
 logger = logging.getLogger(__name__)
@@ -64,65 +63,83 @@ signal.signal(signal.SIGINT, signal_handler)
 
 
 def process_audio_intelligent(audio_file: str, user_id: str, reunion_id: str) -> Tuple[List[Chunk], str, str]:
-    """Full pipeline: Whisper → Nova 3-step → FAISS → S3."""
-    try:
-        logger.info(f"Processing '{audio_file}' — meeting={reunion_id}, user={user_id}")
+    """Full pipeline: ffmpeg → Whisper → Nova steps 1-2 → diarization → Nova step 3 → FAISS → S3."""
+    logger.info(f"Processing '{audio_file}' — meeting={reunion_id}, user={user_id}")
 
-        audio_file = convert_to_wav(audio_file)
+    audio_file = convert_to_wav(audio_file)
 
-        transcript_segments = transcribe_audio(audio_file)
-        if not transcript_segments:
-            raise RuntimeError("Transcription produced no segments")
+    transcript_segments = transcribe_audio(audio_file)
+    if not transcript_segments:
+        raise RuntimeError("Transcription produced no segments")
 
-        raw_text = " ".join(seg["text"] for seg in transcript_segments)
-        cleaned_text = clean_text_with_nova_step1(raw_text)
-        global_themes_data = extract_global_themes_with_nova_step2(cleaned_text)
+    raw_text = " ".join(seg["text"] for seg in transcript_segments)
+    cleaned_text = clean_text_with_nova_step1(raw_text)
+    global_themes_data = extract_global_themes_with_nova_step2(cleaned_text)
 
-        cleaned_segments = apply_cleaned_text_to_segments(transcript_segments, cleaned_text)
-        diarization_segments = perform_diarization(audio_file)
-        merged_segments = merge_transcription_diarization(cleaned_segments, diarization_segments)
+    cleaned_segments = apply_cleaned_text_to_segments(transcript_segments, cleaned_text)
+    diarization_segments = perform_diarization(audio_file)
+    merged_segments = merge_transcription_diarization(cleaned_segments, diarization_segments)
 
-        chunks = rechunk_thematically_step3(merged_segments, cleaned_text, global_themes_data)
-        if not chunks:
-            logger.warning("Nova rechunking returned no chunks — using fallback")
-            chunks = create_semantic_chunks_fallback(merged_segments)
+    chunks = rechunk_thematically_step3(merged_segments, cleaned_text, global_themes_data)
+    if not chunks:
+        logger.warning("Step 3 returned no chunks — using rule-based chunking")
+        chunks = create_rule_based_chunks(merged_segments)
 
-        if NOVA_ENHANCED_EMBEDDINGS:
-            chunks = regenerate_embeddings_after_enrichment(chunks)
+    if NOVA_ENHANCED_EMBEDDINGS:
+        chunks = regenerate_embeddings_after_enrichment(chunks)
 
-        faiss_index = create_faiss_index(chunks)
-        chunks_key, index_key = save_results_to_s3(chunks, user_id, reunion_id, faiss_index)
+    faiss_index = create_faiss_index(chunks)
+    chunks_key, index_key = save_results_to_s3(chunks, user_id, reunion_id, faiss_index)
 
-        metadata = {
-            "workflow_version": "3-step-nova",
-            "global_themes": global_themes_data,
-            "cleaned_text_length": len(cleaned_text),
-            "original_text_length": len(raw_text),
-            "processing_stats": {
-                "total_chunks": len(chunks),
-                "themes_detected": len(global_themes_data.get("themes_principaux", [])),
-                "hot_zones": len(global_themes_data.get("zones_chaudes", [])),
-                "global_keywords": len(global_themes_data.get("mots_cles_globaux", []))
-            }
+    metadata = {
+        "workflow_version": "3-step-nova",
+        "global_themes": global_themes_data,
+        "cleaned_text_length": len(cleaned_text),
+        "original_text_length": len(raw_text),
+        "processing_stats": {
+            "total_chunks": len(chunks),
+            "themes_detected": len(global_themes_data.get("themes_principaux", [])),
+            "hot_zones": len(global_themes_data.get("zones_chaudes", [])),
+            "global_keywords": len(global_themes_data.get("mots_cles_globaux", []))
         }
-        metadata_key = f"{user_id}/{reunion_id}/metadata/{reunion_id}_global_analysis.json"
-        safe_s3_upload(S3_BUCKET_NAME, metadata_key,
-                       json.dumps(metadata, ensure_ascii=False, indent=2, cls=CustomJSONEncoder))
+    }
+    metadata_key = f"{user_id}/{reunion_id}/metadata/{reunion_id}_global_analysis.json"
+    safe_s3_upload(S3_BUCKET_NAME, metadata_key,
+                   json.dumps(metadata, ensure_ascii=False, indent=2, cls=CustomJSONEncoder))
 
-        logger.info(f"Pipeline complete: {len(chunks)} chunks — meeting={reunion_id}")
-        return chunks, chunks_key, index_key
+    logger.info(f"Pipeline complete: {len(chunks)} chunks — meeting={reunion_id}")
+    return chunks, chunks_key, index_key
 
+
+def mark_failed(user_id: str, reunion_id: str) -> None:
+    """Best-effort: record STATUS_FAILED in both tables. Never raises."""
+    key = {"userId": user_id, "reunionId": reunion_id}
+    values = {":s": STATUS_FAILED}
+    try:
+        safe_dynamodb_update(DYNAMODB_TABLE_NAME, key, "SET etat = :s", values)
     except Exception as e:
-        logger.error(f"Pipeline failed for meeting={reunion_id}: {e}")
-        traceback.print_exc()
-        raise
+        logger.warning(f"Could not write failure status for {reunion_id}: {e}")
+    try:
+        dynamodb.Table(UNIQUE_MEETINGS_TABLE_NAME).update_item(
+            Key=key,
+            UpdateExpression="SET etat = :s",
+            ExpressionAttributeValues=values
+        )
+    except Exception as e:
+        logger.warning(f"UniqueMeetings failure status update failed for {reunion_id}: {e}")
 
 
 def process_message(message) -> bool:
-    """Download audio from S3, run pipeline, update DynamoDB."""
+    """Download audio from S3, run the pipeline and update DynamoDB.
+
+    Returns True when the message can be deleted (processed, or invalid and
+    not worth retrying) and False when processing failed.
+    """
     start_time = datetime.now()
     receipt_handle = message["ReceiptHandle"]
     local_audio_path = None
+    user_id: Optional[str] = None
+    reunion_id: Optional[str] = None
 
     try:
         extend_visibility_timeout(receipt_handle)
@@ -146,7 +163,7 @@ def process_message(message) -> bool:
 
         update_expression = "SET etat = :s, s3Chunks = :c, processedAt = :p"
         expression_values = {
-            ":s": "TRAITÉ_INTELLIGENT",
+            ":s": STATUS_PROCESSED,
             ":c": chunks_s3_key,
             ":p": datetime.now().isoformat()
         }
@@ -165,7 +182,7 @@ def process_message(message) -> bool:
             dynamodb.Table(UNIQUE_MEETINGS_TABLE_NAME).update_item(
                 Key={"userId": user_id, "reunionId": reunion_id},
                 UpdateExpression="SET etat = :s",
-                ExpressionAttributeValues={":s": "TRAITÉ_INTELLIGENT"}
+                ExpressionAttributeValues={":s": STATUS_PROCESSED}
             )
         except Exception as e:
             logger.warning(f"UniqueMeetings update failed for {reunion_id}: {e}")
@@ -188,6 +205,8 @@ def process_message(message) -> bool:
         return True
     except Exception as e:
         logger.error(f"Processing failed: {e}", exc_info=True)
+        if user_id and reunion_id:
+            mark_failed(user_id, reunion_id)
         return False
     finally:
         if local_audio_path:
@@ -198,10 +217,15 @@ def process_message(message) -> bool:
                 logger.warning(f"Temp file cleanup failed: {cleanup_err}")
 
 
-def poll_sqs():
-    """Poll SQS once (one-shot mode) or continuously (permanent mode)."""
+def poll_sqs() -> bool:
+    """Poll SQS once (one-shot mode) or continuously (permanent mode).
+
+    Returns False if a message failed in one-shot mode or if the polling loop
+    stopped on an error, True otherwise.
+    """
     mode = "one-shot" if ONE_SHOT_MODE else "permanent"
     logger.info(f"Worker starting in {mode} mode")
+    ok = True
 
     try:
         while running:
@@ -216,7 +240,7 @@ def poll_sqs():
             if not messages:
                 logger.info("No messages in queue")
                 if ONE_SHOT_MODE:
-                    return
+                    break
                 continue
 
             message = messages[0]
@@ -229,11 +253,15 @@ def poll_sqs():
                 logger.error("Message processing failed — left in queue for retry")
 
             if ONE_SHOT_MODE:
-                return
+                ok = success
+                break
 
     except ClientError as e:
         logger.error(f"AWS error: {e.response.get('Error', {}).get('Code')} — {e}")
+        ok = False
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
+        ok = False
 
     logger.info("Worker stopped")
+    return ok

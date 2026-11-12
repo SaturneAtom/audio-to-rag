@@ -2,27 +2,40 @@ import json
 import time
 import logging
 from typing import List, Dict, Any
-from config import bedrock_client, MIN_WORDS_PER_CHUNK, MAX_WORDS_PER_CHUNK
+from config import (bedrock_client, MIN_WORDS_PER_CHUNK, MAX_WORDS_PER_CHUNK,
+                    NOVA_MODEL_ID, NOVA_DIRECT_CHUNKING)
 from models import Chunk
+from aws_utils import with_retries
 from chunking import (
     count_words, create_chunk_from_segments, find_chunk_segments,
-    divide_chunk_intelligently, divide_chunk_by_words,
-    merge_short_chunks_intelligently, create_semantic_chunks_fallback
+    divide_chunk_intelligently, merge_short_chunks_intelligently,
+    create_rule_based_chunks
 )
 
 logger = logging.getLogger(__name__)
 
+MAX_CONTINUATIONS = 5
+
+
+def _strip_code_fences(text: str) -> str:
+    """Remove a leading ```json / ``` fence and a trailing ``` fence, if present."""
+    cleaned = text.strip()
+    for prefix in ("```json", "```"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    return cleaned.strip()
+
 
 def is_json_incomplete(text: str) -> bool:
-    """Return True if text looks like a truncated JSON response."""
+    """Return True if text looks like a truncated JSON response.
+
+    This is a heuristic: any response that fails to parse with an
+    "Expecting ..." error is treated as truncated.
+    """
     try:
-        cleaned = text.strip()
-        for prefix in ("```json", "```"):
-            if cleaned.startswith(prefix):
-                cleaned = cleaned[len(prefix):]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3]
-        json.loads(cleaned.strip())
+        json.loads(_strip_code_fences(text))
         return False
     except json.JSONDecodeError as e:
         return "Expecting" in str(e) or "end of JSON input" in str(e)
@@ -30,45 +43,42 @@ def is_json_incomplete(text: str) -> bool:
         return True
 
 
+def _converse(prompt: str, max_tokens: int) -> str:
+    """Send one user prompt to Nova (with retries) and return the response text."""
+    response = with_retries(
+        lambda: bedrock_client.converse(
+            modelId=NOVA_MODEL_ID,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"maxTokens": max_tokens, "temperature": 0.1}
+        ),
+        "Nova call",
+    )
+    return response["output"]["message"]["content"][0]["text"].strip()
+
+
 def get_nova_response_with_pagination(prompt: str, max_tokens: int = 8000) -> str:
     """Call Nova and automatically request continuations for truncated JSON responses."""
-    response = bedrock_client.converse(
-        modelId="amazon.nova-lite-v1:0",
-        messages=[{"role": "user", "content": [{"text": prompt}]}],
-        inferenceConfig={"maxTokens": max_tokens, "temperature": 0.1}
-    )
-    full_response = response["output"]["message"]["content"][0]["text"].strip()
+    full_response = _converse(prompt, max_tokens)
 
-    for iteration in range(5):
+    for iteration in range(MAX_CONTINUATIONS):
         if not is_json_incomplete(full_response):
             break
-        logger.debug(f"Response truncated, requesting continuation ({iteration + 1}/5)")
+        logger.debug(f"Response truncated, requesting continuation ({iteration + 1}/{MAX_CONTINUATIONS})")
         time.sleep(0.5)
         continuation_prompt = (
             f"Voici le début de ta réponse précédente:\n{full_response}\n\n"
             "Continue exactement où tu t'es arrêté. Donne la SUITE seulement, sans répéter le début.\nSUITE:"
         )
-        response = bedrock_client.converse(
-            modelId="amazon.nova-lite-v1:0",
-            messages=[{"role": "user", "content": [{"text": continuation_prompt}]}],
-            inferenceConfig={"maxTokens": max_tokens, "temperature": 0.1}
-        )
-        full_response += response["output"]["message"]["content"][0]["text"].strip()
+        full_response += _converse(continuation_prompt, max_tokens)
     else:
-        logger.warning("Pagination limit reached (5 iterations)")
+        logger.warning(f"Pagination limit reached ({MAX_CONTINUATIONS} iterations)")
 
     return full_response
 
 
 def _parse_nova_json(response_text: str) -> Any:
     """Strip markdown fences and parse JSON from a Nova response."""
-    cleaned = response_text
-    for prefix in ("```json", "```"):
-        if cleaned.startswith(prefix):
-            cleaned = cleaned[len(prefix):]
-    if cleaned.endswith("```"):
-        cleaned = cleaned[:-3]
-    return json.loads(cleaned.strip())
+    return json.loads(_strip_code_fences(response_text))
 
 
 def apply_cleaned_text_to_segments(segments: List[Dict], cleaned_text: str) -> List[Dict]:
@@ -132,17 +142,12 @@ INSTRUCTIONS:
 
 TEXTE NETTOYÉ:"""
 
-        response = bedrock_client.converse(
-            modelId="amazon.nova-lite-v1:0",
-            messages=[{"role": "user", "content": [{"text": prompt}]}],
-            inferenceConfig={"maxTokens": 8000, "temperature": 0.1}
-        )
-        cleaned = response["output"]["message"]["content"][0]["text"].strip()
+        cleaned = _converse(prompt, max_tokens=8000)
         logger.info(f"Step 1 done: {len(raw_text)} → {len(cleaned)} chars")
         return cleaned
 
     except Exception as e:
-        logger.error(f"Step 1 failed: {e} — using raw text")
+        logger.error(f"Step 1 failed: {e} — using raw text", exc_info=True)
         return raw_text
 
 
@@ -347,8 +352,25 @@ def adjust_chunk_sizes_step3(chunks: List[Chunk], segments: List[Dict]) -> List[
     return final_chunks
 
 
-def create_semantic_chunks_with_nova(segments: List[Dict], global_tags: List[str], global_themes: List[str]) -> List[Chunk]:
-    """Direct Nova chunking: Nova groups segments by topic."""
+def _validate_segment_groups(groups: List[List[int]], segment_count: int) -> List[List[int]]:
+    """Return the groups ordered by position, or raise if they are not a clean partition.
+
+    Every segment must appear exactly once and each group must be a contiguous
+    run of segments; otherwise chunks would overlap in time or drop content.
+    """
+    ordered = sorted((sorted(group) for group in groups if group), key=lambda group: group[0])
+    flattened = [idx for group in ordered for idx in group]
+    if flattened != list(range(segment_count)):
+        raise RuntimeError("Nova grouping does not cover every segment exactly once, in order")
+    return ordered
+
+
+def create_semantic_chunks_with_nova(segments: List[Dict]) -> List[Chunk]:
+    """Optional direct chunking (NOVA_DIRECT_CHUNKING): Nova groups segments by topic.
+
+    Raises if Nova's answer cannot be parsed or is not a clean partition of the
+    segments; the caller then falls back to the rule-based chunker.
+    """
     if not segments:
         return []
 
@@ -383,14 +405,15 @@ Si ta réponse est trop longue, je te demanderai la suite."""
 
     result = _parse_nova_json(get_nova_response_with_pagination(prompt, max_tokens=10000))
 
+    chunk_infos = [info for info in result.get("chunks", []) if info.get("segment_indices")]
+    themes_by_first_index = {min(info["segment_indices"]): info.get("theme") for info in chunk_infos}
+    groups = _validate_segment_groups([info["segment_indices"] for info in chunk_infos], len(segments))
+
     nova_chunks = []
-    for i, chunk_info in enumerate(result.get("chunks", [])):
-        valid_indices = [idx for idx in chunk_info.get("segment_indices", []) if 0 <= idx < len(segments)]
-        if not valid_indices:
-            continue
-        chunk_segments = [segments[idx] for idx in valid_indices]
-        chunk = create_chunk_from_segments(chunk_segments, i + 1)
-        chunk.theme = chunk_info.get("theme", f"chunk-{i + 1}")
+    for chunk_id, indices in enumerate(groups, start=1):
+        chunk_segments = [segments[idx] for idx in indices]
+        chunk = create_chunk_from_segments(chunk_segments, chunk_id)
+        chunk.theme = themes_by_first_index.get(indices[0]) or f"chunk-{chunk_id}"
         chunk.nova_chunking = {
             "theme_principal": chunk.theme,
             "type_contenu": "discussion",
@@ -399,20 +422,29 @@ Si ta réponse est trop longue, je te demanderai la suite."""
         }
         nova_chunks.append(chunk)
 
-    if not nova_chunks:
-        raise RuntimeError("Nova returned no valid chunks")
-
     logger.info(f"Nova chunking: {len(nova_chunks)} chunks from {len(segments)} segments")
     return nova_chunks
 
 
+def _create_base_chunks(segments: List[Dict]) -> List[Chunk]:
+    """Rule-based chunks by default; Nova grouping first when NOVA_DIRECT_CHUNKING is on."""
+    if NOVA_DIRECT_CHUNKING:
+        try:
+            nova_chunks = create_semantic_chunks_with_nova(segments)
+            if nova_chunks:
+                return nova_chunks
+        except Exception as e:
+            logger.warning(f"Nova direct chunking failed: {e} — using rule-based chunking")
+    return create_rule_based_chunks(segments)
+
+
 def rechunk_thematically_step3(segments: List[Dict], cleaned_text: str, global_themes: Dict[str, Any]) -> List[Chunk]:
-    """Step 3 — Per-chunk Nova analysis followed by size adjustment."""
+    """Step 3 — Build base chunks, label each one with Nova, then adjust sizes."""
     try:
         themes = [t["theme"] for t in global_themes.get("themes_principaux", [])]
         logger.info(f"Step 3 start: {len(segments)} segments, {len(themes)} global themes")
 
-        base_chunks = create_semantic_chunks_fallback(segments)
+        base_chunks = _create_base_chunks(segments)
         optimized_chunks = [
             optimize_chunk_with_nova(chunk, global_themes, segments)
             for chunk in base_chunks
@@ -423,5 +455,5 @@ def rechunk_thematically_step3(segments: List[Dict], cleaned_text: str, global_t
         return final_chunks
 
     except Exception as e:
-        logger.error(f"Step 3 failed: {e} — using fallback chunking")
-        return create_semantic_chunks_fallback(segments)
+        logger.error(f"Step 3 failed: {e} — using unlabelled rule-based chunks", exc_info=True)
+        return create_rule_based_chunks(segments)

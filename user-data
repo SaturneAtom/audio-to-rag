@@ -1,17 +1,17 @@
 #!/bin/bash
 exec > /var/log/user-data-debug.log 2>&1
-echo "=== DEBUT $(date) ==="
+echo "=== START $(date) ==="
 
 yum update -y
 yum install -y ecs-init
 echo "ECS_CLUSTER=${ECS_CLUSTER_NAME:-your-ecs-cluster-name}" > /etc/ecs/ecs.config
 
-# Démarrer ECS avec timeout pour éviter le blocage
+# Start ECS with a timeout so the boot sequence cannot hang
 systemctl enable ecs
 timeout 30 systemctl start ecs || true
 
-# Vérifier que ça marche après quelques secondes
+# Check the agent status after a few seconds
 sleep 10
 systemctl status ecs --no-pager
 
-echo "=== FIN $(date) ==="
+echo "=== END $(date) ==="

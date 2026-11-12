@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Environment loading, shared constants and AWS client initialization."""
 
 import boto3
 import os
@@ -28,10 +29,14 @@ def _require_env(name: str) -> str:
     value = os.getenv(name)
     if not value:
         raise ValueError(
-            f"La variable d'environnement '{name}' est obligatoire et n'est pas définie. "
-            f"Copiez .env.example vers .env et renseignez les valeurs."
+            f"Environment variable '{name}' is required and is not set. "
+            f"Copy .env.example to .env and fill in the values."
         )
     return value
+
+
+def _env_flag(name: str, default: str) -> bool:
+    return os.getenv(name, default).lower() == "true"
 
 
 S3_BUCKET_NAME = _require_env("S3_BUCKET_NAME")
@@ -42,17 +47,27 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 VISIBILITY_TIMEOUT = int(os.getenv("VISIBILITY_TIMEOUT", "3600"))
 
-NOVA_ENHANCED_EMBEDDINGS = os.getenv("NOVA_ENHANCED_EMBEDDINGS", "true").lower() == "true"
-ONE_SHOT_MODE = os.getenv("ONE_SHOT_MODE", "true").lower() == "true"
+NOVA_ENHANCED_EMBEDDINGS = _env_flag("NOVA_ENHANCED_EMBEDDINGS", "true")
+NOVA_DIRECT_CHUNKING = _env_flag("NOVA_DIRECT_CHUNKING", "false")
+ONE_SHOT_MODE = _env_flag("ONE_SHOT_MODE", "true")
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "fr")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-logging.getLogger(__name__).info(f"🖥️ Device utilisé: {DEVICE}")
+logging.getLogger(__name__).info(f"Device: {DEVICE}")
 if torch.cuda.is_available():
-    logging.getLogger(__name__).info(f"🎮 GPU détecté: {torch.cuda.get_device_name(0)}")
+    logging.getLogger(__name__).info(f"GPU detected: {torch.cuda.get_device_name(0)}")
 
 MIN_WORDS_PER_CHUNK = 50
 MAX_WORDS_PER_CHUNK = 150
+
+NOVA_MODEL_ID = "amazon.nova-lite-v1:0"
+TITAN_EMBED_MODEL_ID = "amazon.titan-embed-text-v2:0"
+EMBEDDING_DIMENSIONS = 512
+
+# Values written to the DynamoDB `etat` attribute. Downstream components
+# match on these strings, so they are part of the data contract.
+STATUS_PROCESSED = "TRAITÉ_INTELLIGENT"
+STATUS_FAILED = "FAILED"
 
 session = boto3.Session(region_name=AWS_REGION)
 _boto_config = Config(

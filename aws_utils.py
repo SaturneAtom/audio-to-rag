@@ -6,72 +6,62 @@ from config import s3_client, dynamodb, sqs_client, SQS_QUEUE_URL, MAX_RETRIES, 
 logger = logging.getLogger(__name__)
 
 
-def safe_s3_download(bucket, key, local_path, retries=MAX_RETRIES):
-    """Télécharge un fichier S3 avec mécanisme de retry"""
-    for attempt in range(retries):
+def with_retries(operation, description, retries=MAX_RETRIES):
+    """Run `operation()` and retry on ClientError with exponential backoff (1s, 2s, 4s...).
+
+    Returns the operation result, or re-raises the last ClientError once
+    `retries` attempts have been made.
+    """
+    attempts = max(1, retries)
+    for attempt in range(1, attempts + 1):
         try:
-            s3_client.download_file(bucket, key, local_path)
-            return True
+            return operation()
         except ClientError as e:
-            if attempt < retries - 1:
-                logger.warning(f"⚠️ Échec téléchargement S3, tentative {attempt+1}/{retries}: {str(e)}")
-                time.sleep(2 ** attempt)
-            else:
-                logger.error(f"❌ Échec téléchargement S3 après {retries} tentatives: {str(e)}")
+            if attempt == attempts:
+                logger.error(f"{description} failed after {attempts} attempts: {e}")
                 raise
-    return False
+            logger.warning(f"{description} failed, attempt {attempt}/{attempts}: {e}")
+            time.sleep(2 ** (attempt - 1))
+
+
+def safe_s3_download(bucket, key, local_path, retries=MAX_RETRIES):
+    """Download an S3 object to a local file, with retries."""
+    with_retries(lambda: s3_client.download_file(bucket, key, local_path), "S3 download", retries)
+    return True
 
 
 def safe_s3_upload(bucket, key, content, retries=MAX_RETRIES):
-    """Téléverse un contenu dans S3 avec mécanisme de retry"""
-    for attempt in range(retries):
-        try:
-            if isinstance(content, str):
-                s3_client.put_object(Bucket=bucket, Key=key, Body=content.encode('utf-8'))
-            else:
-                s3_client.put_object(Bucket=bucket, Key=key, Body=content)
-            return True
-        except ClientError as e:
-            if attempt < retries - 1:
-                logger.warning(f"⚠️ Échec upload S3, tentative {attempt+1}/{retries}: {str(e)}")
-                time.sleep(2 ** attempt)
-            else:
-                logger.error(f"❌ Échec upload S3 après {retries} tentatives: {str(e)}")
-                raise
-    return False
+    """Upload str or bytes content to S3, with retries."""
+    body = content.encode('utf-8') if isinstance(content, str) else content
+    with_retries(lambda: s3_client.put_object(Bucket=bucket, Key=key, Body=body), "S3 upload", retries)
+    return True
 
 
 def safe_dynamodb_update(table_name, key, update_expression, expression_values, retries=MAX_RETRIES):
-    """Met à jour DynamoDB avec mécanisme de retry"""
+    """Update a DynamoDB item, with retries."""
     table = dynamodb.Table(table_name)
-    for attempt in range(retries):
-        try:
-            table.update_item(
-                Key=key,
-                UpdateExpression=update_expression,
-                ExpressionAttributeValues=expression_values
-            )
-            return True
-        except ClientError as e:
-            if attempt < retries - 1:
-                logger.warning(f"⚠️ Échec MAJ DynamoDB, tentative {attempt+1}/{retries}: {str(e)}")
-                time.sleep(2 ** attempt)
-            else:
-                logger.error(f"❌ Échec MAJ DynamoDB après {retries} tentatives: {str(e)}")
-                raise
-    return False
+    with_retries(
+        lambda: table.update_item(
+            Key=key,
+            UpdateExpression=update_expression,
+            ExpressionAttributeValues=expression_values
+        ),
+        "DynamoDB update",
+        retries,
+    )
+    return True
 
 
 def extend_visibility_timeout(receipt_handle, timeout=VISIBILITY_TIMEOUT):
-    """Prolonge la visibilité d'un message SQS pendant son traitement"""
+    """Extend the visibility timeout of an SQS message (single attempt, best effort)."""
     try:
         sqs_client.change_message_visibility(
             QueueUrl=SQS_QUEUE_URL,
             ReceiptHandle=receipt_handle,
             VisibilityTimeout=timeout
         )
-        logger.debug(f"✓ Visibilité prolongée de {timeout}s")
+        logger.debug(f"Visibility timeout extended by {timeout}s")
         return True
     except ClientError as e:
-        logger.warning(f"⚠️ Impossible de prolonger visibilité: {str(e)}")
+        logger.warning(f"Could not extend visibility timeout: {e}")
         return False

@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Optional
 
 @dataclass
 class Chunk:
-    """Chunk de conversation avec métadonnées sémantiques"""
+    """A conversation chunk with its semantic metadata."""
     id: int
     start_time: float
     end_time: float

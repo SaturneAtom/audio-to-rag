@@ -14,18 +14,26 @@ from config import DEVICE, WHISPER_LANGUAGE
 logger = logging.getLogger(__name__)
 
 
+WHISPER_MODEL = "turbo"
+WHISPER_FALLBACK_MODEL = "tiny"
+DIARIZATION_MODEL = "pyannote/speaker-diarization-3.1"
+
+
 def get_audio_duration(audio_file: str) -> float:
-    """Récupère la durée d'un fichier audio"""
+    """Return the duration of an audio file in seconds (0.0 if it cannot be read)."""
     try:
         y, sr = librosa.load(audio_file)
         return len(y) / sr
     except Exception as e:
-        logger.error(f"Erreur durée audio: {e}")
+        logger.error(f"Could not read audio duration: {e}")
         return 0.0
 
 
 def convert_to_wav(input_file: str) -> str:
-    """Convertit automatiquement tout fichier audio en WAV optimisé"""
+    """Convert an audio file under /tmp to 16 kHz mono WAV and return the WAV path.
+
+    Raises ValueError if the file is outside /tmp and RuntimeError if ffmpeg fails.
+    """
     tmp_dir = Path('/tmp').resolve()
     resolved = Path(input_file).resolve()
     try:
@@ -36,11 +44,11 @@ def convert_to_wav(input_file: str) -> str:
     output_file = str(resolved.with_suffix('.wav'))
 
     if Path(output_file).exists():
-        logger.info(f"✅ Fichier WAV existant utilisé: {output_file}")
+        logger.info(f"Using existing WAV file: {output_file}")
         return output_file
 
+    logger.info("Converting to 16 kHz mono WAV...")
     try:
-        logger.info(f"🔄 Conversion en WAV optimisé...")
         subprocess.run([
             'ffmpeg', '-i', str(resolved),
             '-acodec', 'pcm_s16le',
@@ -48,22 +56,25 @@ def convert_to_wav(input_file: str) -> str:
             '-ac', '1',
             '-y', output_file
         ], check=True, capture_output=True)
-        logger.info(f"✅ Converti en WAV: {output_file}")
-        return output_file
     except subprocess.CalledProcessError as e:
-        logger.error(f"❌ Erreur conversion: {e}")
-        return str(resolved)
+        stderr = (e.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"ffmpeg conversion failed (exit code {e.returncode}): {stderr[-500:]}"
+        ) from e
+
+    logger.info(f"Converted to WAV: {output_file}")
+    return output_file
 
 
 def generate_random_speaker_id() -> str:
-    """Génère un ID de speaker aléatoire (ex: Speaker_A1B2)"""
+    """Generate a random speaker ID (e.g. Speaker_A1B2)."""
     letters = ''.join(random.choices(string.ascii_uppercase, k=2))
     numbers = ''.join(random.choices(string.digits, k=2))
     return f"Speaker_{letters[0]}{numbers[0]}{letters[1]}{numbers[1]}"
 
 
 def create_speaker_mapping(original_speakers: List[str]) -> Dict[str, str]:
-    """Mappe les speakers originaux vers des IDs aléatoires anonymes"""
+    """Map each original speaker label to a unique random ID."""
     speaker_mapping = {}
     used_ids = set()
 
@@ -78,30 +89,24 @@ def create_speaker_mapping(original_speakers: List[str]) -> Dict[str, str]:
 
 
 def perform_diarization(audio_file: str) -> Optional[List[Dict]]:
-    """Effectue la diarisation des locuteurs avec pyannote"""
+    """Run pyannote speaker diarization. Returns None if diarization fails."""
     try:
-        HF_TOKEN = os.environ.get('HF_TOKEN')
-        if not HF_TOKEN:
+        hf_token = os.environ.get('HF_TOKEN')
+        if not hf_token:
             raise ValueError(
-                "HF_TOKEN est obligatoire pour la diarisation. "
-                "Obtenez un token sur https://huggingface.co/settings/tokens "
-                "et acceptez les conditions d'utilisation de pyannote/speaker-diarization-3.1."
+                "HF_TOKEN is required for diarization. "
+                "Create a token at https://huggingface.co/settings/tokens "
+                f"and accept the terms of use of {DIARIZATION_MODEL}."
             )
 
-        logger.info("🔄 Initialisation du modèle de diarisation...")
-        pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            token=HF_TOKEN
-        )
+        logger.info("Loading diarization model...")
+        pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, token=hf_token)
 
         if DEVICE == "cuda":
             pipeline = pipeline.to(torch.device("cuda"))
-            logger.info("✅ Pipeline diarisation configuré pour GPU")
+            logger.info("Diarization pipeline moved to GPU")
 
-        duration = get_audio_duration(audio_file)
-        logger.info(f"⏱️ Durée audio: {duration:.1f}s")
-
-        logger.info("🔄 Début de l'analyse des locuteurs...")
+        logger.info("Running speaker diarization...")
         diarization = pipeline(audio_file)
 
         segments = []
@@ -115,76 +120,65 @@ def perform_diarization(audio_file: str) -> Optional[List[Dict]]:
         for segment in segments:
             segment["speaker"] = speaker_mapping[segment["speaker"]]
 
-        new_speakers = set([seg["speaker"] for seg in segments])
-        logger.info(f"👥 {len(new_speakers)} locuteurs détectés avec IDs aléatoires: {', '.join(sorted(new_speakers))}")
+        new_speakers = set(seg["speaker"] for seg in segments)
+        logger.info(f"{len(new_speakers)} speakers detected, random IDs: {', '.join(sorted(new_speakers))}")
 
         return segments
 
     except Exception as e:
-        logger.error(f"❌ Erreur diarisation: {e}")
+        logger.error(f"Diarization failed: {e}", exc_info=True)
         return None
 
 
+def _transcribe_with_model(audio_file: str, model_name: str) -> List[Dict]:
+    """Transcribe with one Whisper model; every segment gets the same placeholder speaker."""
+    logger.info(f"Loading Whisper model '{model_name}'...")
+    model = load_model(model_name, device=DEVICE)
+
+    logger.info("Transcribing...")
+    result = model.transcribe(audio_file, language=WHISPER_LANGUAGE, task="transcribe")
+
+    default_speaker_id = generate_random_speaker_id()
+    segments = [
+        {
+            "start": segment["start"],
+            "end": segment["end"],
+            "text": segment["text"].strip(),
+            "speaker": default_speaker_id
+        }
+        for segment in result["segments"]
+    ]
+    logger.info(f"{len(segments)} segments transcribed ({model_name})")
+
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return segments
+
+
 def transcribe_audio(audio_file: str) -> List[Dict]:
-    """Transcrit l'audio avec Whisper turbo"""
-    try:
-        logger.info("🔄 Chargement du modèle Whisper...")
-        model = load_model("turbo", device=DEVICE)
-        logger.info("✅ Modèle Whisper chargé")
+    """Transcribe with Whisper turbo, retrying once with Whisper tiny.
 
-        duration = get_audio_duration(audio_file)
-        logger.info(f"⏱️ Durée audio: {duration:.1f}s")
+    Returns an empty list if both models fail; the caller treats that as a failed job.
+    """
+    logger.info(f"Audio duration: {get_audio_duration(audio_file):.1f}s")
 
-        logger.info("🔄 Transcription en cours...")
-        result = model.transcribe(audio_file, language=WHISPER_LANGUAGE, task="transcribe")
-
-        default_speaker_id = generate_random_speaker_id()
-        segments = []
-        for segment in result["segments"]:
-            segments.append({
-                "start": segment["start"],
-                "end": segment["end"],
-                "text": segment["text"].strip(),
-                "speaker": default_speaker_id
-            })
-
-        logger.info(f"✅ {len(segments)} segments transcrits")
-
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        return segments
-
-    except Exception as e:
-        logger.error(f"❌ Erreur transcription: {e}")
+    for model_name in (WHISPER_MODEL, WHISPER_FALLBACK_MODEL):
         try:
-            logger.info("🔄 Tentative avec modèle tiny...")
-            model = load_model("tiny", device=DEVICE)
-            result = model.transcribe(audio_file, language=WHISPER_LANGUAGE, task="transcribe")
+            return _transcribe_with_model(audio_file, model_name)
+        except Exception as e:
+            logger.error(f"Transcription with Whisper '{model_name}' failed: {e}", exc_info=True)
 
-            default_speaker_id = generate_random_speaker_id()
-            segments = []
-            for segment in result["segments"]:
-                segments.append({
-                    "start": segment["start"],
-                    "end": segment["end"],
-                    "text": segment["text"].strip(),
-                    "speaker": default_speaker_id
-                })
-
-            logger.info(f"✅ {len(segments)} segments transcrits (tiny)")
-            del model
-            return segments
-
-        except Exception as e2:
-            logger.error(f"❌ Erreur fallback: {e2}")
-            return []
+    return []
 
 
 def merge_transcription_diarization(transcript_segments: List[Dict],
                                     diarization_segments: List[Dict]) -> List[Dict]:
-    """Fusionne transcription Whisper et diarisation pyannote"""
+    """Assign to each transcript segment the speaker with the longest overlap.
+
+    Segments without any overlapping diarization turn keep their current speaker.
+    """
     if not diarization_segments:
         return transcript_segments
 

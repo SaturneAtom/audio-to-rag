@@ -1,42 +1,49 @@
 import json
 import logging
-import tempfile
 import numpy as np
 import faiss
 from typing import List, Optional
-from config import bedrock_client
+from config import bedrock_client, TITAN_EMBED_MODEL_ID, EMBEDDING_DIMENSIONS
 from models import Chunk
+from aws_utils import with_retries
 
 logger = logging.getLogger(__name__)
 
 
 def generate_titan_embedding(text: str) -> Optional[np.ndarray]:
-    """Génère un embedding vectoriel avec Amazon Titan Embed v2"""
+    """Embed text with Amazon Titan Embed v2. Returns None if the call fails.
+
+    A missing embedding is tolerated while chunks are being built, but
+    `create_faiss_index` refuses to index a chunk without one.
+    """
     try:
         body = json.dumps({
             "inputText": text,
-            "dimensions": 512,
+            "dimensions": EMBEDDING_DIMENSIONS,
             "normalize": True
         })
-        response = bedrock_client.invoke_model(
-            modelId="amazon.titan-embed-text-v2:0",
-            body=body,
-            contentType="application/json"
+        response = with_retries(
+            lambda: bedrock_client.invoke_model(
+                modelId=TITAN_EMBED_MODEL_ID,
+                body=body,
+                contentType="application/json"
+            ),
+            "Titan embedding",
         )
         response_body = json.loads(response['body'].read())
         return np.array(response_body['embedding'], dtype=np.float32)
 
     except Exception as e:
-        logger.error(f"Erreur embedding Titan: {e}")
+        logger.error(f"Titan embedding failed: {e}")
         return None
 
 
 def regenerate_embeddings_after_enrichment(chunks: List[Chunk]) -> List[Chunk]:
-    """Régénère les embeddings en enrichissant le texte avec les métadonnées Nova"""
-    logger.info("🔄 Régénération des embeddings avec métadonnées Nova...")
+    """Recompute embeddings on the chunk text augmented with its Nova metadata tags."""
+    logger.info("Regenerating embeddings with Nova metadata...")
 
     if not chunks:
-        logger.warning("⚠️ Aucun chunk à enrichir")
+        logger.warning("No chunks to enrich")
         return chunks
 
     updated_chunks = []
@@ -69,7 +76,7 @@ def regenerate_embeddings_after_enrichment(chunks: List[Chunk]) -> List[Chunk]:
             enriched_count += 1
 
         if i == 0:
-            logger.debug(f"Enrichissement chunk 1: tags={enrichment_tags}")
+            logger.debug(f"First chunk enrichment tags: {enrichment_tags}")
 
         new_embedding = generate_titan_embedding(enriched_text)
 
@@ -88,29 +95,33 @@ def regenerate_embeddings_after_enrichment(chunks: List[Chunk]) -> List[Chunk]:
             nova_chunking=chunk.nova_chunking.copy() if chunk.nova_chunking else {}
         ))
 
-    logger.info(f"✅ Embeddings régénérés: {enriched_count}/{len(chunks)} chunks enrichis avec métadonnées Nova")
+    logger.info(f"Embeddings regenerated: {enriched_count}/{len(chunks)} chunks enriched with Nova metadata")
     return updated_chunks
 
 
 def create_faiss_index(chunks: List[Chunk]) -> Optional[faiss.IndexFlatIP]:
-    """Crée un index FAISS pour la recherche vectorielle"""
-    try:
-        embeddings = [chunk.embedding for chunk in chunks if chunk.embedding is not None]
+    """Build a FAISS inner-product index with one row per chunk, in chunk order.
 
-        if not embeddings:
-            logger.warning("⚠️ Aucun embedding disponible")
-            return None
-
-        embeddings_matrix = np.vstack(embeddings).astype('float32')
-        faiss.normalize_L2(embeddings_matrix)
-
-        dimension = embeddings_matrix.shape[1]
-        index = faiss.IndexFlatIP(dimension)
-        index.add(embeddings_matrix)
-
-        logger.info(f"✅ Index FAISS créé: {index.ntotal} vecteurs")
-        return index
-
-    except Exception as e:
-        logger.error(f"❌ Erreur création index FAISS: {e}")
+    Row i of the index always corresponds to chunks[i]. If any chunk has no
+    embedding the job fails rather than producing an index whose rows no
+    longer line up with the chunks JSON.
+    """
+    if not chunks:
+        logger.warning("No chunks to index")
         return None
+
+    missing = [chunk.id for chunk in chunks if chunk.embedding is None]
+    if missing:
+        raise RuntimeError(
+            f"{len(missing)}/{len(chunks)} chunks have no embedding (chunk ids: {missing}); "
+            "refusing to build a misaligned FAISS index"
+        )
+
+    embeddings_matrix = np.vstack([chunk.embedding for chunk in chunks]).astype('float32')
+    faiss.normalize_L2(embeddings_matrix)
+
+    index = faiss.IndexFlatIP(embeddings_matrix.shape[1])
+    index.add(embeddings_matrix)
+
+    logger.info(f"FAISS index created: {index.ntotal} vectors")
+    return index
