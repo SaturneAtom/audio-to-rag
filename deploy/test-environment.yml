@@ -1,0 +1,265 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Disposable test environment for the audio-to-rag worker: ECR repository, SQS queue,
+  S3 bucket, two DynamoDB tables and a CPU-only Fargate task definition.
+  Nothing runs at rest; a task is billed only while it processes a message.
+  Delete the stack to remove everything (empty the S3 bucket first).
+
+Parameters:
+  Name:
+    Type: String
+    Default: audio-to-rag-test
+    AllowedPattern: "[a-z0-9-]+"
+    Description: Prefix for every resource name.
+  TaskCpu:
+    Type: String
+    Default: "4096"
+    AllowedValues: ["2048", "4096", "8192"]
+  TaskMemory:
+    Type: String
+    Default: "16384"
+    Description: MiB. Whisper turbo and pyannote on CPU need roughly 8 GB or more.
+  HfTokenParameterName:
+    Type: String
+    Default: ""
+    Description: >
+      Optional. Name of an SSM SecureString parameter holding the Hugging Face token,
+      for example /audio-to-rag-test/hf-token. Leave empty to run without diarization.
+
+Conditions:
+  HasHfToken: !Not [!Equals [!Ref HfTokenParameterName, ""]]
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref Name
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules": [{"rulePriority": 1, "description": "Keep the last 5 images",
+            "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 5},
+            "action": {"type": "expire"}}]}
+
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Name}-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-test-data
+            Status: Enabled
+            ExpirationInDays: 30
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Name}-dlq"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref Name
+      VisibilityTimeout: 3600
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  MeetingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${Name}-meetings"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: reunionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: reunionId
+          KeyType: RANGE
+
+  UniqueMeetingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${Name}-unique-meetings"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: reunionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: reunionId
+          KeyType: RANGE
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref Name
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${Name}"
+      RetentionInDays: 14
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Name}-execution"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      Policies:
+        - !If
+          - HasHfToken
+          - PolicyName: read-hf-token
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: ssm:GetParameters
+                  Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${HfTokenParameterName}"
+          - !Ref AWS::NoValue
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Name}-task"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: worker
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SqsConsumer
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt Queue.Arn
+              - Sid: S3ReadWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "${Bucket.Arn}/*"
+              - Sid: DynamoDbStatus
+                Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt MeetingsTable.Arn
+                  - !GetAtt UniqueMeetingsTable.Arn
+              - Sid: Bedrock
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.nova-lite-v1:0"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref Name
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: X86_64
+      EphemeralStorage:
+        SizeInGiB: 60
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          # Placeholder: the Deploy workflow registers a revision with the real image.
+          Image: !Sub "${Repository.RepositoryUri}:bootstrap"
+          Essential: true
+          Environment:
+            - Name: S3_BUCKET_NAME
+              Value: !Ref Bucket
+            - Name: DYNAMODB_TABLE_NAME
+              Value: !Ref MeetingsTable
+            - Name: UNIQUE_MEETINGS_TABLE_NAME
+              Value: !Ref UniqueMeetingsTable
+            - Name: SQS_QUEUE_URL
+              Value: !Ref Queue
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: ONE_SHOT_MODE
+              Value: "true"
+            - Name: WHISPER_LANGUAGE
+              Value: fr
+          Secrets: !If
+            - HasHfToken
+            - - Name: HF_TOKEN
+                ValueFrom: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${HfTokenParameterName}"
+            - !Ref AWS::NoValue
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+
+Outputs:
+  RepositoryName:
+    Value: !Ref Repository
+  ClusterName:
+    Value: !Ref Cluster
+  TaskFamily:
+    Value: !Ref Name
+  ContainerName:
+    Value: worker
+  TaskRoleArn:
+    Value: !GetAtt TaskRole.Arn
+  ExecutionRoleArn:
+    Value: !GetAtt ExecutionRole.Arn
+  QueueUrl:
+    Value: !Ref Queue
+  BucketName:
+    Value: !Ref Bucket
+  MeetingsTableName:
+    Value: !Ref MeetingsTable
+  UniqueMeetingsTableName:
+    Value: !Ref UniqueMeetingsTable
