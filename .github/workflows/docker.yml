@@ -1,0 +1,37 @@
+name: Docker image
+
+on:
+  push:
+    paths:
+      - Dockerfile
+      - requirements.lock
+      - .dockerignore
+      - docker/**
+      - .github/workflows/docker.yml
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The CUDA-enabled PyTorch wheels need several GB of free space.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+          df -h /
+
+      - name: Build image
+        timeout-minutes: 20
+        run: docker build --progress=plain -t audio-to-rag:ci .
+
+      # Real dependencies, no AWS call, no GPU: see docker/smoke_test.py.
+      - name: Smoke test
+        timeout-minutes: 10
+        run: docker run --rm audio-to-rag:ci python docker/smoke_test.py
+
+      - name: Image size
+        run: docker images audio-to-rag:ci --format '{{.Size}}'

@@ -55,3 +55,25 @@ def test_speaker_mapping_is_anonymous_and_unique():
     assert set(mapping) == set(originals)
     assert len(set(mapping.values())) == len(originals)
     assert all(re.fullmatch(r"Speaker_[A-Z]\d[A-Z]\d", new_id) for new_id in mapping.values())
+
+
+class _FakeAnnotation:
+    def itertracks(self, yield_label=False):
+        return iter(())
+
+
+class _FakeDiarizeOutput:
+    """Shape of pyannote.audio 4.x pipeline output."""
+
+    def __init__(self, annotation):
+        self.speaker_diarization = annotation
+
+
+def test_speaker_annotation_unwraps_pyannote_4_output():
+    annotation = _FakeAnnotation()
+    assert audio.speaker_annotation(_FakeDiarizeOutput(annotation)) is annotation
+
+
+def test_speaker_annotation_keeps_legacy_annotation():
+    annotation = _FakeAnnotation()
+    assert audio.speaker_annotation(annotation) is annotation

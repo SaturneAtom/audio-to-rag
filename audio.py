@@ -88,6 +88,15 @@ def create_speaker_mapping(original_speakers: List[str]) -> Dict[str, str]:
     return speaker_mapping
 
 
+def speaker_annotation(output):
+    """Return the speaker Annotation from a pyannote pipeline output.
+
+    pyannote.audio 4.x returns a DiarizeOutput whose `speaker_diarization`
+    attribute holds the Annotation; legacy pipelines return the Annotation itself.
+    """
+    return getattr(output, "speaker_diarization", output)
+
+
 def perform_diarization(audio_file: str) -> Optional[List[Dict]]:
     """Run pyannote speaker diarization. Returns None if diarization fails."""
     try:
@@ -107,7 +116,7 @@ def perform_diarization(audio_file: str) -> Optional[List[Dict]]:
             logger.info("Diarization pipeline moved to GPU")
 
         logger.info("Running speaker diarization...")
-        diarization = pipeline(audio_file)
+        diarization = speaker_annotation(pipeline(audio_file))
 
         segments = []
         original_speakers = set()

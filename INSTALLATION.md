@@ -6,7 +6,7 @@ Detailed setup instructions for audio-to-rag. For a quick start and the full lis
 
 ## System requirements
 
-- Python 3.10+
+- Python 3.12+
 - FFmpeg
 
 ```bash
@@ -29,17 +29,17 @@ python -m venv .venv
 source .venv/bin/activate      # macOS / Linux
 # .venv\Scripts\activate       # Windows
 
-# PyTorch is not listed in requirements.txt (the Docker base image provides it)
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-# Runtime dependencies
-pip install -r requirements.txt
-
-# Whisper must be installed from source
-pip install git+https://github.com/openai/whisper.git
+# Fully pinned runtime dependencies (torch, pyannote.audio, Whisper, FAISS...)
+pip install -r requirements.lock
 ```
 
-The Docker image performs the same steps (plus `apt-get install ffmpeg`), so none of this is needed when you only build and deploy the container.
+`requirements.txt` lists the top-level dependencies and their version constraints; `requirements.lock` is generated from it and pins every package. After changing `requirements.txt`, regenerate the lock:
+
+```bash
+uv pip compile requirements.txt --universal --python-version 3.12 -o requirements.lock
+```
+
+The Docker image installs the same lock (plus `apt-get install ffmpeg`), so none of this is needed when you only build and deploy the container.
 
 Verify the install (no AWS calls made):
 
@@ -121,13 +121,9 @@ Optional variables (`NOVA_DIRECT_CHUNKING`, `NOVA_ENHANCED_EMBEDDINGS`, `ONE_SHO
 
 Whisper turbo and Pyannote run significantly faster on GPU. The pipeline detects CUDA automatically.
 
-```bash
-# Replace the CPU torch build with a CUDA-enabled one
-pip uninstall torch torchvision torchaudio -y
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-```
+On Linux x86_64, the PyTorch wheel pinned in `requirements.lock` (2.11) is CUDA-enabled and bundles a CUDA 13 runtime: no separate CUDA install is needed, but the host needs an NVIDIA driver from the 580 series or later. On macOS the same lock installs the CPU/MPS build.
 
-On AWS, GPU inference requires ECS on EC2 GPU instances (for example `g4dn.xlarge`); Fargate does not provide GPUs.
+On AWS, GPU inference requires ECS on EC2 GPU instances (for example `g4dn.xlarge`) with a recent ECS GPU-optimized AMI; Fargate does not provide GPUs.
 
 Verify:
 

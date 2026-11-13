@@ -1,21 +1,28 @@
-# audio-to-rag — runtime dependencies
-# Install with: pip install -r requirements.txt
+# audio-to-rag — top-level runtime dependencies.
 #
-# PyTorch is provided by the Docker base image (pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime).
-# For a local CPU-only setup: pip install torch --index-url https://download.pytorch.org/whl/cpu
+# The Docker image installs the fully pinned requirements.lock, generated from this file:
+#   uv pip compile requirements.txt --universal --python-version 3.12 -o requirements.lock
 #
-# Whisper is installed separately from source (the Dockerfile does this):
-#   pip install git+https://github.com/openai/whisper.git
+# Version constraints:
+# - pyannote.audio 4.x is required: audio.py calls Pipeline.from_pretrained(..., token=...),
+#   an argument that pyannote 3.x does not accept.
+# - pyannote.audio 4.x needs torch and torchaudio >= 2.8. The last torchaudio release is 2.11,
+#   which fixes torch at 2.11.
+# - torchcodec (pyannote's audio decoder) must match the torch release: 0.11 pairs with torch 2.11.
+
+# Deep learning stack
+torch==2.11.0
+torchaudio==2.11.0  # must match torch exactly: torchaudio 2.11.1 needs torch 2.11.1, which is not published
+torchcodec==0.11.*
+
+# Speech
+pyannote.audio>=4.0,<4.1
+openai-whisper==20250625
+librosa
 
 # AWS SDK
 boto3
 botocore
-
-# Audio processing (duration probe)
-librosa
-
-# Speaker diarization
-pyannote.audio
 
 # Vector search
 faiss-cpu

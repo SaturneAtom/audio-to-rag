@@ -2,7 +2,7 @@
 
 > An async, queue-driven worker that turns raw meeting recordings into structured, speaker-aware, theme-labelled chunks with embeddings and a FAISS index, on AWS.
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+![Python](https://img.shields.io/badge/Python-3.12%2B-blue)
 ![AWS](https://img.shields.io/badge/AWS-SQS%20%7C%20S3%20%7C%20DynamoDB%20%7C%20Bedrock-orange)
 ![Whisper](https://img.shields.io/badge/Whisper-turbo-green)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
@@ -73,7 +73,7 @@ S3 audio file
     │
     ├─► [4] Nova — Step 2       → extract global themes, keywords, hot zones
     │
-    ├─► [5] Pyannote 3.1        → speaker diarization (who spoke when)
+    ├─► [5] Pyannote           → speaker diarization (who spoke when)
     │
     ├─► [6] Merge               → each segment gets the speaker with the longest overlap
     │
@@ -178,7 +178,7 @@ Some steps degrade gracefully, others fail the job on purpose:
 | Component | Technology | Role |
 |-----------|------------|------|
 | Transcription | OpenAI Whisper turbo | Speech-to-text with timestamps |
-| Speaker diarization | Pyannote Audio 3.1 | Who spoke and when |
+| Speaker diarization | pyannote.audio 4 (`speaker-diarization-3.1` pipeline) | Who spoke and when |
 | Text cleaning | Amazon Nova Lite | Fix errors, remove filler words |
 | Semantic analysis | Amazon Nova Lite | Extract themes, keywords, hot zones |
 | Chunking | Rule-based (`chunking.py`) | Word-count, pause and speaker-change boundaries |
@@ -196,7 +196,7 @@ Some steps degrade gracefully, others fail the job on purpose:
 
 | Requirement | Notes |
 |-------------|-------|
-| Python 3.10+ | |
+| Python 3.12+ | The pinned dependency set (`requirements.lock`) targets 3.12 |
 | FFmpeg | `brew install ffmpeg` / `apt install ffmpeg` |
 | AWS account | Bedrock must be enabled; activate **Nova Lite** and **Titan Embed v2** in the [Bedrock console](https://console.aws.amazon.com/bedrock/home#/modelaccess) |
 | Hugging Face account | Free; accept [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1) terms of use |
@@ -214,10 +214,8 @@ cd audio-to-rag
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
-# 3. Install dependencies (torch first; see INSTALLATION.md for GPU builds)
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install -r requirements.txt
-pip install git+https://github.com/openai/whisper.git
+# 3. Install the pinned dependencies (see INSTALLATION.md for GPU notes)
+pip install -r requirements.lock
 
 # 4. Configure
 cp .env.example .env
@@ -237,6 +235,13 @@ The unit tests cover the pure logic (message validation, path guard, speaker mer
 pip install -r requirements-dev.txt
 pytest -q
 ruff check .
+```
+
+The Docker image has its own smoke test, run in CI on every change to the Dockerfile or the lock file: it imports the real dependencies and the application modules, converts and decodes audio with ffmpeg and torchcodec, transcribes a short clip with Whisper `tiny` and queries a FAISS index. It makes no AWS call and needs no GPU:
+
+```bash
+docker build -t audio-to-rag .
+docker run --rm audio-to-rag python docker/smoke_test.py
 ```
 
 There is no end-to-end test: the full pipeline is only exercised against real AWS services.
@@ -373,12 +378,12 @@ aws ecr get-login-password --region <REGION> | docker login --username AWS --pas
 docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/audio-to-rag:latest
 ```
 
-The image installs ffmpeg, the Python dependencies and Whisper, and runs as a non-root user.
+The image is built from `python:3.12-slim`, installs ffmpeg and the fully pinned `requirements.lock`, and runs as a non-root user. The PyTorch wheel bundles its own CUDA runtime, so the same image runs on CPU and on GPU.
 
 Run it as an **ECS task** started once per SQS message by your own trigger (for example a Lambda function or an EventBridge Pipe calling `RunTask`); the trigger is not part of this repository. With `ONE_SHOT_MODE=true` the task exits when its message is done, so nothing runs between jobs.
 
-- **CPU**: Fargate is an option for CPU-only runs. Fargate has no GPU, so Whisper and Pyannote run on CPU there (slower; size the task memory for the models) — override the base image with a CPU PyTorch image via `--build-arg BASE_IMAGE=...` if you want a smaller image.
-- **GPU**: Whisper and Pyannote are significantly faster on GPU. The default base image is `pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime`; run the task on ECS with **EC2 GPU instances** (`g4dn.xlarge` or larger).
+- **CPU**: Fargate is an option for CPU-only runs. Fargate has no GPU, so Whisper and Pyannote run on CPU there (slower; size the task memory for the models).
+- **GPU**: Whisper and Pyannote are significantly faster on GPU. Run the task on ECS with **EC2 GPU instances** (`g4dn.xlarge` or larger). The pinned PyTorch (2.11) ships a CUDA 13 runtime, which needs an NVIDIA driver from the 580 series or later on the host; use a recent ECS GPU-optimized AMI.
 
 Helper scripts for the EC2 GPU option:
 - `simple-ecs.sh` — configure the ECS agent on a GPU EC2 instance (ECS-optimized AMI)
