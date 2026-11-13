@@ -1,0 +1,110 @@
+name: Deploy
+
+# Deploys only on a version tag (git tag v1.2.3 && git push --tags) or a manual run.
+# Without the repository variables below, the job is skipped instead of failing.
+#
+# Repository variables (Settings > Secrets and variables > Actions > Variables):
+#   AWS_ROLE_ARN        role created by deploy/github-actions-role.yml
+#   AWS_REGION          for example eu-west-3
+#   ECR_REPOSITORY      ECR repository name, for example audio-to-rag
+#   ECS_TASK_FAMILY     task definition family used by the trigger
+#   ECS_CONTAINER_NAME  container name inside that task definition
+#
+# No AWS key is stored in GitHub: the job gets short-lived credentials through OIDC.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    if: vars.AWS_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      ECS_TASK_FAMILY: ${{ vars.ECS_TASK_FAMILY }}
+      ECS_CONTAINER_NAME: ${{ vars.ECS_CONTAINER_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Unit tests
+        run: |
+          pip install -r requirements-dev.txt
+          ruff check .
+          pytest -q
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+
+      - name: Build image
+        timeout-minutes: 20
+        run: docker build --progress=plain -t audio-to-rag:${{ github.sha }} .
+
+      # Never push an image that fails the smoke test.
+      - name: Smoke test
+        timeout-minutes: 10
+        run: docker run --rm audio-to-rag:${{ github.sha }} python docker/smoke_test.py
+
+      - name: AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push image
+        id: push
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          docker tag "audio-to-rag:${GITHUB_SHA}" "$IMAGE"
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      # Registers a new revision of the task definition with the new image.
+      # A trigger that runs the family without a revision picks it up on the next message.
+      - name: Register task definition
+        id: register
+        env:
+          IMAGE: ${{ steps.push.outputs.image }}
+        run: |
+          aws ecs describe-task-definition --task-definition "$ECS_TASK_FAMILY" \
+            --query taskDefinition > current.json
+          jq --arg name "$ECS_CONTAINER_NAME" --arg image "$IMAGE" '
+            del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)
+            | if any(.containerDefinitions[]; .name == $name) then .
+              else error("container \($name) not found in the task definition") end
+            | .containerDefinitions |= map(if .name == $name then .image = $image else . end)
+          ' current.json > new.json
+          ARN=$(aws ecs register-task-definition --cli-input-json file://new.json \
+            --query taskDefinition.taskDefinitionArn --output text)
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Deployed"
+            echo "- Image: \`${{ steps.push.outputs.image }}\`"
+            echo "- Task definition: \`${{ steps.register.outputs.arn }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

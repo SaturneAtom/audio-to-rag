@@ -2,12 +2,14 @@ name: Docker image
 
 on:
   push:
-    paths:
+    paths: &image_paths
       - Dockerfile
       - requirements.lock
       - .dockerignore
       - docker/**
       - .github/workflows/docker.yml
+  pull_request:
+    paths: *image_paths
   workflow_dispatch:
 
 jobs:

@@ -389,6 +389,28 @@ Helper scripts for the EC2 GPU option:
 - `simple-ecs.sh` — configure the ECS agent on a GPU EC2 instance (ECS-optimized AMI)
 - `user-data` — EC2 user-data bootstrap that installs and starts the ECS agent
 
+### Continuous deployment
+
+`.github/workflows/deploy.yml` deploys on a version tag (`git tag v1.2.3 && git push --tags`) or a manual run from `main`. It runs the unit tests, builds the image, runs the smoke test, pushes the image to ECR tagged with the commit SHA, and registers a new revision of the worker task definition with that image. A trigger that starts the task by family (without a revision number) uses the new revision on its next message; one that pins a revision has to be updated separately.
+
+No AWS key is stored in GitHub: the workflow assumes an IAM role through OpenID Connect and gets credentials that expire after the run. One-time setup:
+
+1. Create the role with `deploy/github-actions-role.yml`. It can push to one ECR repository, register task definitions and pass the two worker roles, nothing else, and only from version tags or `main`.
+
+   ```bash
+   aws cloudformation deploy \
+     --stack-name audio-to-rag-github-deploy \
+     --template-file deploy/github-actions-role.yml \
+     --capabilities CAPABILITY_NAMED_IAM \
+     --parameter-overrides TaskRoleArn=<task role ARN> ExecutionRoleArn=<execution role ARN>
+   ```
+
+   Add `CreateOidcProvider=false` if the account already has the GitHub OIDC provider.
+
+2. Set the repository variables (Settings → Secrets and variables → Actions → Variables): `AWS_ROLE_ARN` (stack output), `AWS_REGION`, `ECR_REPOSITORY`, `ECS_TASK_FAMILY`, `ECS_CONTAINER_NAME`. Until `AWS_ROLE_ARN` is set, the deploy job is skipped.
+
+The CI workflow also runs gitleaks on the full history, since GitHub secret scanning is not available on every plan.
+
 ---
 
 ## Module reference

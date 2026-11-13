@@ -1,0 +1,100 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  IAM role that the audio-to-rag Deploy workflow assumes through GitHub OIDC.
+  It can push to one ECR repository and register task definitions, nothing else.
+  No long-lived AWS key is created.
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Default: SaturneAtom
+  GitHubRepo:
+    Type: String
+    Default: audio-to-rag
+  EcrRepositoryName:
+    Type: String
+    Default: audio-to-rag
+    Description: Existing ECR repository the workflow pushes to.
+  TaskRoleArn:
+    Type: String
+    Description: Task role of the worker task definition (S3, SQS, DynamoDB, Bedrock).
+  ExecutionRoleArn:
+    Type: String
+    Description: Execution role of the worker task definition (ECR pull, logs).
+  CreateOidcProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Set to false if the account already has the token.actions.githubusercontent.com provider.
+
+Conditions:
+  CreateProvider: !Equals [!Ref CreateOidcProvider, "true"]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${GitHubRepo}-github-deploy"
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+              StringLike:
+                # Version tags, and manual runs from the main branch only.
+                "token.actions.githubusercontent.com:sub":
+                  - !Sub "repo:${GitHubOwner}/${GitHubRepo}:ref:refs/tags/v*"
+                  - !Sub "repo:${GitHubOwner}/${GitHubRepo}:ref:refs/heads/main"
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EcrLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: EcrPush
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: !Sub "arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepositoryName}"
+              - Sid: TaskDefinitions
+                Effect: Allow
+                # These two actions do not support resource-level permissions.
+                Action:
+                  - ecs:DescribeTaskDefinition
+                  - ecs:RegisterTaskDefinition
+                Resource: "*"
+              - Sid: PassWorkerRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !Ref TaskRoleArn
+                  - !Ref ExecutionRoleArn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+Outputs:
+  RoleArn:
+    Description: Value for the AWS_ROLE_ARN repository variable.
+    Value: !GetAtt DeployRole.Arn
