@@ -16,13 +16,12 @@ import sys
 import tempfile
 
 # Dummy configuration so that config.py can be imported without a real deployment.
-# boto3 clients are created at import time but make no network call until used.
+# boto3 clients are created at import time but need no credentials and make no
+# network call until used, so no AWS credentials are set here.
 os.environ.setdefault("S3_BUCKET_NAME", "smoke-test-bucket")
 os.environ.setdefault("DYNAMODB_TABLE_NAME", "smoke-test-table")
 os.environ.setdefault("SQS_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/000000000000/smoke-test")
 os.environ.setdefault("AWS_REGION", "us-east-1")
-os.environ.setdefault("AWS_ACCESS_KEY_ID", "smoke-test")
-os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "smoke-test")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
