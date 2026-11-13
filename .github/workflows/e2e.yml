@@ -1,0 +1,124 @@
+name: E2E
+
+# Runs the real worker once against the resources of deploy/e2e-environment.yml:
+# Polly speaks a short fake meeting -> S3 + SQS -> worker container -> checks S3 and DynamoDB.
+# Runs on demand only: a manual run, or pushing a tag named e2e-* (git tag e2e-1 && git push origin e2e-1).
+# Needs the repository variables E2E_ROLE_ARN, E2E_REGION, E2E_BUCKET, E2E_QUEUE_URL,
+# E2E_TABLE and E2E_UNIQUE_TABLE (stack outputs); skipped without them.
+
+on:
+  push:
+    tags: ["e2e-*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: e2e
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    if: vars.E2E_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      AWS_REGION: ${{ vars.E2E_REGION }}
+      BUCKET: ${{ vars.E2E_BUCKET }}
+      QUEUE_URL: ${{ vars.E2E_QUEUE_URL }}
+      TABLE: ${{ vars.E2E_TABLE }}
+      UNIQUE_TABLE: ${{ vars.E2E_UNIQUE_TABLE }}
+      USER_ID: e2e-user
+      REUNION_ID: run-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+
+      - name: Build image
+        timeout-minutes: 20
+        run: docker build --progress=plain -t audio-to-rag:e2e .
+
+      - name: AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.E2E_ROLE_ARN }}
+          aws-region: ${{ vars.E2E_REGION }}
+
+      - name: Synthesize a short meeting with Polly
+        run: |
+          cat > meeting.txt <<'EOF'
+          Bonjour à tous. On fait le point sur la sortie de l'application mobile.
+          Le développement est presque terminé, mais les tests de paiement ne sont pas finis.
+          Je propose de décaler la mise en production au quinze janvier.
+          D'accord pour le quinze janvier. Il faut aussi prévenir le service client avant la sortie.
+          Je m'en occupe cette semaine. Autre sujet : le budget marketing du premier trimestre.
+          On garde le même budget, mais on concentre les dépenses sur LinkedIn et les salons.
+          Très bien. Prochaine réunion lundi pour valider le plan de communication.
+          EOF
+          aws polly synthesize-speech --engine neural --voice-id Lea --language-code fr-FR \
+            --output-format mp3 --text "$(tr '\n' ' ' < meeting.txt)" meeting.mp3
+          ls -l meeting.mp3
+
+      - name: Upload audio and send the SQS message
+        run: |
+          KEY="$USER_ID/$REUNION_ID/audio.mp3"
+          aws s3 cp meeting.mp3 "s3://$BUCKET/$KEY"
+          aws sqs send-message --queue-url "$QUEUE_URL" \
+            --message-body "{\"userId\":\"$USER_ID\",\"reunionId\":\"$REUNION_ID\",\"s3Audio\":\"$KEY\"}"
+
+      # The container gets the short-lived OIDC credentials from the environment.
+      - name: Run the worker once
+        timeout-minutes: 25
+        run: |
+          docker run --rm \
+            -e AWS_REGION -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+            -e S3_BUCKET_NAME="$BUCKET" -e SQS_QUEUE_URL="$QUEUE_URL" \
+            -e DYNAMODB_TABLE_NAME="$TABLE" -e UNIQUE_MEETINGS_TABLE_NAME="$UNIQUE_TABLE" \
+            -e ONE_SHOT_MODE=true -e WHISPER_LANGUAGE=fr \
+            audio-to-rag:e2e
+
+      - name: Check the outputs
+        run: |
+          PREFIX="$USER_ID/$REUNION_ID"
+          aws s3 ls "s3://$BUCKET/$PREFIX/" --recursive
+          aws s3 cp "s3://$BUCKET/$PREFIX/chunks/$REUNION_ID.json" chunks.json
+          aws s3 cp "s3://$BUCKET/$PREFIX/index/$REUNION_ID.faiss" index.faiss
+          aws s3 cp "s3://$BUCKET/$PREFIX/metadata/${REUNION_ID}_global_analysis.json" metadata.json
+          STATUS=$(aws dynamodb get-item --table-name "$TABLE" \
+            --key "{\"userId\":{\"S\":\"$USER_ID\"},\"reunionId\":{\"S\":\"$REUNION_ID\"}}" \
+            --query 'Item.etat.S' --output text)
+          echo "DynamoDB status: $STATUS"
+          test "$STATUS" = "TRAITÉ_INTELLIGENT"
+          python3 - <<'EOF'
+          import json
+          chunks = json.load(open("chunks.json"))
+          items = chunks["chunks"] if isinstance(chunks, dict) else chunks
+          assert items, "no chunk produced"
+          meta = json.load(open("metadata.json"))
+          print(f"{len(items)} chunk(s)")
+          for c in items:
+              print(f"- [{c.get('theme')}] {c.get('text', '')[:160]}")
+          themes = [t.get("theme") for t in meta.get("global_themes", {}).get("themes_principaux", [])]
+          print("global themes:", themes)
+          EOF
+          {
+            echo "### E2E passed"
+            echo "- meeting: \`$REUNION_ID\`, status \`$STATUS\`"
+            echo "- outputs: chunks JSON, FAISS index, global analysis"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up test data
+        if: always()
+        run: |
+          aws s3 rm "s3://$BUCKET/$USER_ID/$REUNION_ID/" --recursive || true
+          for T in "$TABLE" "$UNIQUE_TABLE"; do
+            aws dynamodb delete-item --table-name "$T" \
+              --key "{\"userId\":{\"S\":\"$USER_ID\"},\"reunionId\":{\"S\":\"$REUNION_ID\"}}" || true
+          done
+          aws sqs purge-queue --queue-url "$QUEUE_URL" || true

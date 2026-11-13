@@ -1,0 +1,170 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Disposable end-to-end test environment for audio-to-rag. The E2E workflow runs the real
+  worker container on a GitHub runner against these resources: an S3 bucket, an SQS queue,
+  two DynamoDB tables, and an IAM role GitHub assumes through OIDC (no stored AWS key).
+  Nothing runs at rest. To remove everything:
+    aws s3 rm s3://<BucketName> --recursive && aws cloudformation delete-stack --stack-name audio-to-rag-e2e
+
+Parameters:
+  Name:
+    Type: String
+    Default: audio-to-rag-e2e
+    AllowedPattern: "[a-z0-9-]+"
+  GitHubOwner:
+    Type: String
+    Default: SaturneAtom
+  GitHubRepo:
+    Type: String
+    Default: audio-to-rag
+  CreateOidcProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Set to false if the account already has the token.actions.githubusercontent.com provider.
+
+Conditions:
+  CreateProvider: !Equals [!Ref CreateOidcProvider, "true"]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Name}-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-test-data
+            Status: Enabled
+            ExpirationInDays: 1
+
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref Name
+      VisibilityTimeout: 3600
+      MessageRetentionPeriod: 3600
+      SqsManagedSseEnabled: true
+
+  MeetingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${Name}-meetings"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: reunionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: reunionId
+          KeyType: RANGE
+
+  UniqueMeetingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${Name}-unique-meetings"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: reunionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: reunionId
+          KeyType: RANGE
+
+  TestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Name}-github"
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+              StringLike:
+                "token.actions.githubusercontent.com:sub": !Sub "repo:${GitHubOwner}/${GitHubRepo}:*"
+      Policies:
+        - PolicyName: e2e
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Bucket
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "${Bucket.Arn}/*"
+              - Sid: BucketList
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt Bucket.Arn
+              - Sid: Queue
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                  - sqs:PurgeQueue
+                Resource: !GetAtt Queue.Arn
+              - Sid: Tables
+                Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                  - dynamodb:DeleteItem
+                Resource:
+                  - !GetAtt MeetingsTable.Arn
+                  - !GetAtt UniqueMeetingsTable.Arn
+              - Sid: Bedrock
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.nova-lite-v1:0"
+                  - !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+              - Sid: Polly
+                Effect: Allow
+                Action: polly:SynthesizeSpeech
+                Resource: "*"
+
+Outputs:
+  RoleArn:
+    Value: !GetAtt TestRole.Arn
+  BucketName:
+    Value: !Ref Bucket
+  QueueUrl:
+    Value: !Ref Queue
+  MeetingsTableName:
+    Value: !Ref MeetingsTable
+  UniqueMeetingsTableName:
+    Value: !Ref UniqueMeetingsTable
